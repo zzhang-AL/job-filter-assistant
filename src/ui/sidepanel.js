@@ -1,6 +1,7 @@
 import { MSG, MODE } from '../common/constants.js';
 import { scoreProfile } from '../common/profile.js';
 import { applyFilters } from '../common/filters.js';
+import { hrActivityTier, activitySortKey, isStaleHr } from '../common/activity.js';
 import { VERDICT_LABELS, GREETING_LEVELS, normalizeGreetings, DIM_LABELS } from '../common/ai/prompts.js';
 import { send, h, toast, esc, debounce } from './ui-common.js';
 
@@ -21,9 +22,10 @@ const view = {
   greetLevel: 'standard', // 招呼语档位：short | standard | detailed
   search: '',
   verdict: 'all',
-  sort: 'recent',
+  sort: 'active', // 默认 HR 活跃优先
   platform: 'all',
 };
+let lastMode = null; // 上次同步到筛选的平台模式
 let selectedUid = null; // 手动选中的「当前岗位」；null 时按页面自动识别
 const greetingCache = new Map(); // uid -> 编辑中的招呼语文本（会话态）
 let greetingTextarea = null; // 当前渲染的招呼语输入框引用
@@ -31,13 +33,23 @@ const tailorCache = new Map(); // uid -> 简历定制建议（仅会话态，不
 const tailoring = new Set(); // 正在生成简历建议的 uid
 const checked = new Set(); // 岗位库中勾选的 uid（批量操作）
 let batchBusy = false; // 批量分析进行中（禁用按钮 + 防重入）
+let autoStatus = null; // 后台自动分析进度 { running, pending, done, lastError, lastErrorAt }
+let batchPause = null; // 批量分析里补详情被挂起：{ reason, resumeAt, waiting }
 
 async function boot() {
   await reload();
+  // 后台有正在进行的批量（侧边栏关掉期间仍在跑，或后台重启后恢复的）：接上进度
+  send(MSG.BATCH_STATUS).then((st) => {
+    if (st && st.running && !batchBusy) watchBatch(st);
+  }).catch(() => {});
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
-    if (msg.type === MSG.JOBS_UPDATED) {
-      reload();
+    if (msg.type === MSG.JOBS_UPDATED || msg.type === MSG.CONTACTS_UPDATED) {
+      // 自动流水线运行时这类广播很密（每补一个详情、每出一个分数都会发），合并成一次刷新
+      reloadSoon();
+    } else if (msg.type === MSG.AUTO_STATUS) {
+      autoStatus = msg.status;
+      updateAutoLine();
     } else if (msg.type === MSG.CURRENT_JOB) {
       // 网站上点开了新岗位：取消手动固定，跟随网站，实时刷新当前岗位视图
       onCurrentJobChanged();
@@ -51,7 +63,26 @@ async function onCurrentJobChanged() {
   if (view.tab === 'current') render();
 }
 
-async function reload() {
+const reloadSoon = debounce(() => reload({ background: true }), 600);
+
+// background：由后台广播触发的刷新。用户正在输入（招呼语、搜索框）时先不重绘，等失焦后再补，避免打断输入
+let pendingRender = false;
+function isTyping() {
+  const el = document.activeElement;
+  if (!el || !app.contains(el)) return false;
+  return el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && !['checkbox', 'radio', 'button'].includes(el.type)) || el.isContentEditable;
+}
+app.addEventListener('focusout', () => {
+  if (!pendingRender) return;
+  setTimeout(() => {
+    if (pendingRender && !isTyping()) {
+      pendingRender = false;
+      render();
+    }
+  }, 0);
+});
+
+async function reload({ background = false } = {}) {
   try {
     [jobs, settings, profile, providers, activeCtx] = await Promise.all([
       send(MSG.JOB_LIST_REQUEST),
@@ -60,12 +91,47 @@ async function reload() {
       send(MSG.AI_PROVIDERS_GET),
       send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
     ]);
-    view.platform = settings.mode === MODE.auto ? view.platform : settings.mode;
+    autoStatus = await send(MSG.AUTO_STATUS_GET).catch(() => autoStatus);
+    // 平台筛选以用户最后一次的选择为准（侧边栏重开也保留）；只有模式设置真的被改了才跟随模式。
+    // 后台刷新（收录、标记已沟通、出分数等）不能覆盖用户手动点选的平台
+    if (lastMode === null) {
+      lastMode = settings.mode;
+      view.platform = loadPlatformFilter() || modePlatform(settings.mode);
+    } else if (settings.mode !== lastMode) {
+      lastMode = settings.mode;
+      setPlatformFilter(modePlatform(settings.mode));
+    }
   } catch (e) {
     app.innerHTML = `<div class="empty"><div class="icon">⚠️</div>${esc(e.message)}</div>`;
     return;
   }
+  if (background && isTyping()) {
+    // 焦点在搜索框：只刷新列表（不动输入框），新收录的岗位照常出现；其他输入（招呼语等）等失焦再重绘
+    if (view.tab === 'library' && document.activeElement && document.activeElement.closest('.sp-search')) {
+      refreshLibraryList();
+      return;
+    }
+    pendingRender = true;
+    return;
+  }
   render();
+}
+
+const PLATFORM_FILTER_KEY = 'jobHelperSpPlatform';
+const modePlatform = (mode) => (mode === MODE.auto ? 'all' : mode);
+function loadPlatformFilter() {
+  try {
+    const v = localStorage.getItem(PLATFORM_FILTER_KEY);
+    return ['all', 'boss', 'qcwy'].includes(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+function setPlatformFilter(v) {
+  view.platform = v;
+  try {
+    localStorage.setItem(PLATFORM_FILTER_KEY, v);
+  } catch {}
 }
 
 async function refreshContext() {
@@ -102,8 +168,14 @@ function greetingValueFor(job) {
   return greetingsOf(job.match)[view.greetLevel] || '';
 }
 
+// 已沟通的岗位按设置隐藏（与收录规则一致）；屏蔽的岗位已移出岗位库
+function hiddenAsContacted(j) {
+  if (!j.contacted || !settings.skipContacted) return false;
+  return j.contacted === 'job' || settings.skipContactedCompanies;
+}
+
 function visibleJobs() {
-  let list = jobs.slice();
+  let list = jobs.filter((j) => !hiddenAsContacted(j));
   if (view.platform !== 'all') list = list.filter((j) => j.platform === view.platform);
   list = applyFilters(list, settings.filters);
   const q = view.search.trim().toLowerCase();
@@ -119,17 +191,66 @@ function visibleJobs() {
     if (view.verdict === 'unscored') list = list.filter((j) => !j.match);
     else list = list.filter((j) => j.match && j.match.verdict === view.verdict);
   }
-  if (view.sort === 'score') {
-    list.sort((a, b) => (b.match?.score ?? -1) - (a.match?.score ?? -1));
-  } else if (view.sort === 'salary') {
-    list.sort((a, b) => (b.salaryMaxK ?? b.salaryMinK ?? 0) - (a.salaryMaxK ?? a.salaryMinK ?? 0));
-  } else {
-    list.sort((a, b) => (b.lastSeenAt || b.savedAt || '').localeCompare(a.lastSeenAt || a.savedAt || ''));
-  }
+  const byScore = (a, b) => (b.match?.score ?? -1) - (a.match?.score ?? -1);
+  const byRecent = (a, b) => (b.lastSeenAt || b.savedAt || '').localeCompare(a.lastSeenAt || a.savedAt || '');
+  let cmp;
+  if (view.sort === 'score') cmp = byScore;
+  else if (view.sort === 'salary') cmp = (a, b) => (b.salaryMaxK ?? b.salaryMinK ?? 0) - (a.salaryMaxK ?? a.salaryMinK ?? 0);
+  else if (view.sort === 'recent') cmp = byRecent;
+  else cmp = (a, b) => activitySortKey(a) - activitySortKey(b) || byScore(a, b) || byRecent(a, b); // HR 活跃优先，同档按匹配分
+  // 任何排序下，HR 数月 / 半年未活跃的都沉到最后
+  list.sort((a, b) => (isStaleHr(a) - isStaleHr(b)) || cmp(a, b));
   return list;
 }
 
+// 重绘会重建滚动容器，需要还原滚动位置：
+//  - 岗位库列表：按「平台 / 匹配档 / 排序 / 搜索」分别记住位置（存 localStorage），
+//    切到「当前岗位」再回来、侧边栏关掉重开、后台刷新都回到原处；换了筛选条件则用该条件自己的位置
+//  - 当前岗位详情：只在同一岗位、同一子页重绘时还原（换岗位 / 子页签从顶部开始）
+const LIST_SCROLL_KEY = 'jobHelperSpListScroll';
+const listScroll = loadListScroll();
+let lastViewKey = '';
+function loadListScroll() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LIST_SCROLL_KEY) || '{}');
+    return v && typeof v === 'object' ? v : {};
+  } catch {
+    return {};
+  }
+}
+const saveListScroll = debounce(() => {
+  try {
+    localStorage.setItem(LIST_SCROLL_KEY, JSON.stringify(listScroll));
+  } catch {}
+}, 300);
+const listScrollKey = () => [view.platform, view.verdict, view.sort, view.search.trim()].join('|');
+
 function render() {
+  const cur = view.tab === 'current' ? currentJob() : null;
+  const viewKey = view.tab === 'current' ? `current|${cur ? cur.uid : ''}|${view.sub}` : 'library';
+  // 同一视图的重绘（后台广播刷新、点星标等）不再播放淡入动画，否则整列卡片会一起闪一下
+  app.classList.toggle('no-anim', viewKey === lastViewKey);
+  const curBody = viewKey === lastViewKey ? app.querySelector('.cur-body') : null;
+  const curTop = curBody ? curBody.scrollTop : 0;
+  lastViewKey = viewKey;
+  renderNow();
+  if (view.tab === 'current') {
+    const el = app.querySelector('.cur-body');
+    if (el && curTop) el.scrollTop = curTop;
+    return;
+  }
+  const list = app.querySelector('.sp-list');
+  if (!list) return;
+  const key = listScrollKey();
+  if (listScroll[key]) list.scrollTop = listScroll[key];
+  list.addEventListener('scroll', () => {
+    listScroll[listScrollKey()] = list.scrollTop;
+    saveListScroll();
+  }, { passive: true });
+}
+
+function renderNow() {
+  pendingRender = false;
   greetingTextarea = null;
   app.innerHTML = '';
 
@@ -141,6 +262,9 @@ function render() {
 
   const list = visibleJobs();
   app.appendChild(renderTopBar(list.length, 'library'));
+
+  app.appendChild(h('div', { id: 'sp-auto-line' }));
+  updateAutoLine();
 
   const ps = scoreProfile(profile);
   if (ps.score < 40) {
@@ -160,22 +284,39 @@ function render() {
   }
 
   const listEl = h('div', { class: 'sp-list' });
+  fillList(listEl, list);
+  app.appendChild(listEl);
+  app.appendChild(renderBottom(list));
+}
+
+function fillList(listEl, list) {
+  listEl.innerHTML = '';
   if (!list.length) {
     listEl.appendChild(
       h('div', { class: 'empty' }, [
         h('div', { class: 'icon', text: '📭' }),
-        h('div', { text: jobs.length ? '没有符合条件的岗位' : '还没有收录岗位' }),
+        h('div', { text: jobs.some((j) => !hiddenAsContacted(j)) ? '没有符合条件的岗位' : '还没有收录岗位' }),
         h('div', {
           class: 'tiny',
-          text: jobs.length ? '试试调整筛选条件' : '打开 BOSS直聘 或 前程无忧 浏览岗位即可自动收录',
+          text: jobs.some((j) => !hiddenAsContacted(j)) ? '试试调整筛选条件' : '打开 BOSS直聘 或 前程无忧 浏览岗位即可自动收录',
         }),
       ]),
     );
   } else {
     for (const job of list) listEl.appendChild(renderCard(job));
   }
-  app.appendChild(listEl);
-  app.appendChild(renderBottom(list));
+}
+
+// 搜索时只换列表内容、计数与底栏，顶栏（含搜索框）保持不动
+function refreshLibraryList() {
+  const listEl = app.querySelector('.sp-list');
+  if (view.tab !== 'library' || !listEl) return render();
+  const list = visibleJobs();
+  fillList(listEl, list);
+  listEl.scrollTop = listScroll[listScrollKey()] || 0;
+  const count = document.getElementById('sp-count');
+  if (count) count.textContent = `共 ${jobs.length} 个岗位 · 显示 ${list.length}`;
+  updateBatchBar();
 }
 
 // —— 顶栏：logo + 标题 + 顶级 Tab（岗位库/当前岗位）+（岗位库时）搜索筛选 ——
@@ -191,6 +332,7 @@ function renderTopBar(shown, mode) {
       h('div', { class: 'sp-title', text: '岗位面板' }),
       h('div', {
         class: 'sp-count',
+        id: 'sp-count',
         text: mode === 'library' ? `共 ${jobs.length} 个岗位 · 显示 ${shown}` : ctxLabel(),
       }),
     ]),
@@ -205,13 +347,21 @@ function renderTopBar(shown, mode) {
 
   if (mode === 'library') {
     const searchInput = h('input', { type: 'text', placeholder: '搜索岗位/公司/技能', value: view.search });
-    searchInput.addEventListener(
-      'input',
-      debounce(() => {
-        view.search = searchInput.value;
-        render();
-      }, 250),
-    );
+    // 只刷新列表、不整页重绘：重建输入框会打断中文输入法组字、丢光标。
+    // 组字中（拼音还没上屏）不筛选；停顿 400ms 或按回车再应用
+    const applySearch = () => {
+      if (view.search === searchInput.value) return;
+      view.search = searchInput.value;
+      refreshLibraryList();
+    };
+    const applySoon = debounce(applySearch, 400);
+    searchInput.addEventListener('input', (e) => {
+      if (!e.isComposing) applySoon();
+    });
+    searchInput.addEventListener('compositionend', applySoon);
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) applySearch();
+    });
 
     const verdictChips = [
       ['all', '全部'],
@@ -227,7 +377,7 @@ function renderTopBar(shown, mode) {
       }),
     );
 
-    const sortSel = h('select', { class: 'sp-sort' }, [opt('recent', '最近收录'), opt('score', '匹配分'), opt('salary', '薪资')]);
+    const sortSel = h('select', { class: 'sp-sort' }, [opt('active', 'HR 活跃优先'), opt('score', '匹配分'), opt('recent', '最近收录'), opt('salary', '薪资')]);
     sortSel.value = view.sort;
     sortSel.addEventListener('change', () => { view.sort = sortSel.value; render(); });
 
@@ -239,7 +389,7 @@ function renderTopBar(shown, mode) {
       h('button', {
         class: 'filter-chip' + (view.platform === v ? ' active' : ''),
         text: label,
-        onclick: () => { view.platform = v; render(); },
+        onclick: () => { setPlatformFilter(v); render(); },
       }),
     );
 
@@ -298,6 +448,12 @@ function renderCard(job) {
   if (risks.length) {
     for (const r of risks.slice(0, 2)) tags.push(h('span', { class: 'chip chip-red', text: '⚠ ' + r }));
   }
+  if (job.contacted) tags.unshift(contactedChip(job));
+  if (!m && (job.autoScoreFails || 0) >= 2) {
+    tags.unshift(h('span', { class: 'chip chip-red', text: '自动分析失败', title: `${job.autoScoreError || ''}（已不再自动重试，可点「AI 分析」手动重试）` }));
+  }
+  const act = activityChip(job);
+  if (act) tags.unshift(act);
 
   const metaParts = [];
   metaParts.push(h('span', { class: `plat plat-${job.platform}`, text: job.platform === 'boss' ? 'BOSS' : '51job' }));
@@ -321,7 +477,7 @@ function renderCard(job) {
     })(),
   ]);
 
-  const card = h('div', { class: 'job-card fade-up' + (isChecked ? ' is-checked' : '') }, [
+  const card = h('div', { class: 'job-card fade-up' + (isChecked ? ' is-checked' : '') + (isStaleHr(job) ? ' is-stale' : '') }, [
     h('div', { class: 'jc-head' }, [
       checkbox,
       h('div', { class: 'jc-main clickable', title: '在「当前岗位」查看', onclick: () => openCurrent(job, 'info') }, [
@@ -348,6 +504,20 @@ function renderCard(job) {
       job.url
         ? h('button', { class: 'jc-icon-btn', text: '↗', title: '打开原岗位', onclick: () => chrome.tabs.create({ url: job.url }) })
         : null,
+      job.contacted === 'job'
+        ? null
+        : h('button', {
+            class: 'jc-icon-btn',
+            text: '💬',
+            title: '标记为已沟通：之后不再收录、不参与批量/自动匹配（可在设置中撤销）',
+            onclick: () => markContactedUi([job.uid]),
+          }),
+      h('button', {
+        class: 'jc-icon-btn',
+        text: '🚫',
+        title: '屏蔽：移出岗位库，之后不再收录（清空岗位库也有效）',
+        onclick: () => blockJobsUi([job.uid]),
+      }),
       h('button', {
         class: 'jc-icon-btn',
         text: '🗑',
@@ -357,6 +527,95 @@ function renderCard(job) {
     ]),
   ]);
   return card;
+}
+
+// HR 活跃标签：很活跃绿色、两周 / 本月橙色、数月 / 半年红色醒目
+function activityChip(job) {
+  const tier = hrActivityTier(job);
+  if (tier == null) return null;
+  const text = job.hrActiveText || '在线';
+  const cls = tier <= 1 ? 'chip chip-green' : tier <= 3 ? 'chip chip-orange' : 'chip chip-red';
+  const title = hrActiveTitle(job) + (tier === 4 ? '；HR 长期未活跃，岗位可能已停招，已排到最后' : '');
+  return h('span', { class: cls, text: tier === 4 ? `⚠ HR ${text}` : `HR ${text}`, title });
+}
+
+// 自动分析状态行：进行中显示剩余数；最近 30 分钟内出错显示原因（之前出错是静默的，看起来像「停了」）
+function updateAutoLine() {
+  const el = document.getElementById('sp-auto-line');
+  if (!el) return;
+  el.innerHTML = '';
+  if (batchPause) el.appendChild(renderPauseHint(batchPause));
+  const st = autoStatus;
+  if (!st || !settings || !settings.autoScore) return;
+  if (st.running && st.pending) {
+    el.appendChild(h('div', { class: 'profile-hint', text: `🤖 自动分析中 · 还剩 ${st.pending} 个（详情就绪即分析）` }));
+  } else if (st.lastError && Date.now() - (st.lastErrorAt || 0) < 30 * 60 * 1000) {
+    el.appendChild(h('div', { class: 'profile-hint', title: st.lastError, text: `⚠️ 自动分析出错：${st.lastError.slice(0, 60)}` }));
+  }
+}
+
+const BOSS_LOGIN_URL = 'https://www.zhipin.com/web/user/?ka=header-login';
+
+function resumeInText(resumeAt) {
+  const min = Math.ceil(((resumeAt || 0) - Date.now()) / 60000);
+  return min > 0 ? `约 ${min} 分钟后自动继续` : '即将自动继续';
+}
+
+// 补详情挂起：原因 + 立即继续 / 去登录（登录完成后会自动继续）
+function renderPauseHint(p) {
+  const needLogin = /未登录/.test(p.reason);
+  return h('div', { class: 'profile-hint pause-hint' }, [
+    h('span', { class: 'pause-text', text: `⏸ ${p.reason}，${p.waiting} 个岗位待补详情，${resumeInText(p.resumeAt)}` }),
+    needLogin ? h('button', { class: 'btn btn-sm', text: '去登录', onclick: () => chrome.tabs.create({ url: BOSS_LOGIN_URL }) }) : null,
+    h('button', { class: 'btn btn-sm', text: '立即继续', onclick: resumeDetailsUi }),
+  ]);
+}
+
+async function resumeDetailsUi() {
+  try {
+    await send(MSG.WORKER_HALT_CLEAR);
+    batchPause = null;
+    updateAutoLine();
+    toast('已解除暂停，继续补全详情');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function contactedChip(job) {
+  return job.contacted === 'job'
+    ? h('span', { class: 'chip chip-orange', text: '已沟通', title: '你已和该岗位 HR 沟通过，批量/自动匹配会跳过' })
+    : h('span', { class: 'chip chip-orange', text: '已沟通该公司', title: '你沟通过这家公司的其他岗位' });
+}
+
+// 手动标记已沟通（比如在 App 上聊过、插件没同步到）
+async function markContactedUi(uids) {
+  if (!uids.length) return;
+  try {
+    const r = await send(MSG.CONTACTS_MARK, { uids });
+    jobs = r.jobs;
+    uids.forEach((u) => checked.delete(u));
+    render();
+    const hidden = settings.skipContacted ? '，已从列表隐藏' : '';
+    toast(`已标记 ${uids.length} 个岗位为已沟通${hidden}（可在设置 → 已沟通与屏蔽中撤销）`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+// 屏蔽：从岗位库移除并加入屏蔽名单，后续不再收录
+async function blockJobsUi(uids) {
+  if (!uids.length) return;
+  try {
+    const r = await send(MSG.JOB_BLOCK, { uids });
+    jobs = r.jobs;
+    uids.forEach((u) => checked.delete(u));
+    if (selectedUid && uids.includes(selectedUid)) selectedUid = null;
+    render();
+    toast(`已屏蔽 ${uids.length} 个岗位，之后不再收录（可在设置中解除）`);
+  } catch (e) {
+    toast(e.message, true);
+  }
 }
 
 function openCurrent(job, sub) {
@@ -395,6 +654,7 @@ function renderCurrent() {
       h('div', { class: 'cur-title', text: job.title }),
       job.salaryText ? h('div', { class: 'cur-salary', text: job.salaryText }) : null,
       h('div', { class: 'cur-company', text: job.company + (job.companyIndustry ? ' · ' + job.companyIndustry : '') }),
+      job.contacted || activityChip(job) ? h('div', { class: 'jc-tags' }, [activityChip(job), job.contacted ? contactedChip(job) : null]) : null,
     ]),
     h(
       'div',
@@ -440,7 +700,9 @@ function renderJobInfo(panel, job) {
   const factRow = (k, v) => (v ? facts.push(h('div', { class: 'fact' }, [h('span', { class: 'fk', text: k }), h('span', { class: 'fv', text: v })])) : null);
   factRow('薪资', job.salaryText);
   factRow('城市', job.city + (job.district ? ' · ' + job.district : ''));
-  factRow('经验', job.experience);
+  factRow('地址', job.address);
+  // 经验以详情为准；JD 正文写明的年限与标签不同时一并显示
+  factRow('经验', [job.experience, job.experienceJd && job.experienceJd !== job.experience ? `JD 写明 ${job.experienceJd}` : ''].filter(Boolean).join(' · '));
   factRow('学历', job.degree);
   factRow('平台', job.platform === 'boss' ? 'BOSS 直聘' : '前程无忧 51job');
   if (facts.length) panel.appendChild(h('div', { class: 'cur-facts' }, facts));
@@ -476,10 +738,23 @@ function renderJobInfo(panel, job) {
       h('button', { class: 'btn btn-sm btn-block', text: '↗ 打开原岗位页面', style: 'margin-top:14px', onclick: () => chrome.tabs.create({ url: job.url }) }),
     );
   }
+  if (job.contacted !== 'job') {
+    panel.appendChild(
+      h('button', { class: 'btn btn-sm btn-block', text: '💬 标记为已沟通', style: 'margin-top:8px', onclick: () => markContactedUi([job.uid]) }),
+    );
+  }
+  panel.appendChild(
+    h('button', { class: 'btn btn-sm btn-block', text: '🚫 屏蔽该岗位（不再收录）', style: 'margin-top:8px', onclick: () => blockJobsUi([job.uid]) }),
+  );
 }
 
 function renderAnalysis(m) {
-  const box = h('div', { class: 'jc-analysis' }, [m.summary ? h('div', { class: 'summary', text: m.summary }) : null]);
+  const box = h('div', { class: 'jc-analysis' }, [
+    m.summary ? h('div', { class: 'summary', text: m.summary }) : null,
+    m.activityPenalty
+      ? h('div', { class: 'cur-note', text: `因 HR 活跃度已扣 ${m.activityPenalty} 分（扣分前 ${m.rawScore}）` })
+      : null,
+  ]);
   // 硬门槛提示（存在明确不匹配的强制要求时醒目提示，但不隐藏分数——由你自己判断是否投递）
   if (m.eligible === false && m.blockers && m.blockers.length) {
     const gate = h('div', { class: 'gate-warn' }, [h('div', { class: 'gate-title', text: '⛔ 存在硬性门槛' })]);
@@ -526,6 +801,7 @@ function renderCompany(panel, job) {
   row('性质', job.companyType);
   row('阶段', job.companyStage);
   row('HR', [job.hrName, job.hrTitle].filter(Boolean).join(' · '));
+  row('HR 活跃', job.hrActiveText ? `${job.hrActiveText}（${fmtTime(job.hrActiveAt)} 观测）` : job.hrOnline ? '在线' : '');
 
   if (rows.length) {
     panel.appendChild(h('div', { class: 'cur-facts' }, rows));
@@ -746,13 +1022,12 @@ function fillBottom(bar, list) {
           h('button', { class: 'linklike', text: '清空选择', onclick: () => { checked.clear(); render(); } }),
         ]),
         h('div', { class: 'batch-row2' }, [
-          h('button', {
-            class: 'btn btn-sm btn-primary',
-            text: `批量分析（${n}）`,
-            disabled: batchBusy,
-            onclick: () => batchAnalyze(checkedJobs()),
-          }),
+          batchBusy
+            ? h('button', { class: 'btn btn-sm btn-danger', text: '停止批量分析', onclick: stopBatch })
+            : h('button', { class: 'btn btn-sm btn-primary', text: `批量分析（${n}）`, onclick: () => batchAnalyze(checkedJobs()) }),
           h('button', { class: 'btn btn-sm', text: `批量导出（${n}）`, onclick: () => batchExport(checkedJobs()) }),
+          h('button', { class: 'btn btn-sm', text: `标记已沟通（${n}）`, onclick: () => markContactedUi(Array.from(checked)) }),
+          h('button', { class: 'btn btn-sm btn-danger', text: `批量屏蔽（${n}）`, onclick: () => blockJobsUi(Array.from(checked)) }),
         ]),
       ]),
     );
@@ -817,7 +1092,7 @@ async function sendGreeting(job) {
   }
   try {
     // 新建标签页打开岗位并自动进入与 HR 的沟通（保留当前浏览的标签）
-    const r = await send(MSG.OPEN_JOB_CHAT, { url: job.url, platform: job.platform, text });
+    const r = await send(MSG.OPEN_JOB_CHAT, { uid: job.uid, url: job.url, platform: job.platform, text });
     if (r && r.mode === 'sent') toast('已在新标签页打开与 HR 的沟通并尝试发送，招呼语已复制备用');
     else toast('已在新标签页打开岗位并进入沟通，招呼语已复制，请在聊天框 Ctrl+V 粘贴发送');
   } catch (e) {
@@ -870,7 +1145,8 @@ function setBatchBusy(v) {
   }
 }
 
-// 逐个分析（短请求 + 进度），避免一次性长请求把 MV3 后台拖死导致挂起
+// 批量分析：交给后台流水线——详情已就绪的立即匹配，未就绪的边补全边匹配（哪个详情读完就马上分析哪个）。
+// 这里只轮询进度、刷新转圈与分数。
 async function batchAnalyze(list) {
   if (batchBusy) return;
   if (!providers.length) {
@@ -879,46 +1155,68 @@ async function batchAnalyze(list) {
     return;
   }
   if (!list.length) return;
-  const uids = list.map((j) => j.uid);
   setBatchBusy(true);
-  uids.forEach((u) => scoring.add(u));
   render();
-  let ok = 0, fail = 0;
-  let firstErr = '';
+  let st;
   try {
-    for (let i = 0; i < uids.length; i++) {
-      const uid = uids[i];
-      const job = jobs.find((j) => j.uid === uid);
-      toast(`批量分析 ${i + 1}/${uids.length}…`);
-      try {
-        await send(MSG.AI_MATCH_SCORE, { uid, job });
-        ok++;
-      } catch (e) {
-        fail++;
-        const em = e instanceof Error ? e.message : String(e);
-        if (!firstErr) firstErr = em;
-        // 立刻把失败原因显示出来，不再等到最后（否则用户以为卡死）
-        toast(`第 ${i + 1} 个失败：${em}`, true);
-        // 第一个就失败：多半是供应商/画像/网络配置问题，后面必然全挂，中止并报出真实原因
-        if (i === 0) {
-          scoring.delete(uid);
-          throw new Error(`分析失败：${em}`);
-        }
-      }
-      scoring.delete(uid);
+    st = await send(MSG.BATCH_START, { uids: list.map((j) => j.uid) });
+  } catch (e) {
+    toast(e.message, true);
+    setBatchBusy(false);
+    render();
+    return;
+  }
+  await watchBatch(st);
+}
+
+// 跟踪后台批量进度直到结束；侧边栏重新打开时也用它接上正在进行的批量
+async function watchBatch(st) {
+  setBatchBusy(true);
+  try {
+    for (;;) {
+      scoring.clear();
+      (st.pendingUids || []).forEach((u) => scoring.add(u));
+      batchPause = st.running && st.paused ? { reason: st.paused, resumeAt: st.resumeAt, waiting: st.detail } : null;
       jobs = await send(MSG.JOB_LIST_REQUEST).catch(() => jobs);
       render();
-      // 调用之间留间隔，避免供应商限流（429）；最后一个不等
-      if (i < uids.length - 1) await sleep(500);
+      if (!st.running) break;
+      const done = st.ok + st.fail + st.skipped;
+      if (batchPause && !(st.queued + st.scoring)) {
+        // 挂起期间只剩等详情的：提示原因，不刷进度（恢复按钮在列表上方）
+        toast(`批量分析已暂停 ${done}/${st.total}：${st.paused}，${resumeInText(st.resumeAt)}`, true);
+        setBatchBusy(true);
+        await sleep(2500);
+        st = await send(MSG.BATCH_STATUS);
+        continue;
+      }
+      const parts = [`批量分析 ${done}/${st.total}`];
+      if (st.detail) parts.push(`补全详情 ${st.detail}`);
+      if (st.queued + st.scoring) parts.push(`AI 分析中 ${st.queued + st.scoring}`);
+      toast(parts.join(' · ') + (st.detail ? '（详情按人工节奏补全，读完即分析）' : '') + '…');
+      setBatchBusy(true); // 有进展就续上看门狗，避免长时间补全被误判超时
+      await sleep(2500);
+      st = await send(MSG.BATCH_STATUS);
     }
-    if (fail) toast(`批量分析完成：成功 ${ok}，失败 ${fail}（${firstErr}）`, true);
-    else toast(`批量分析完成：成功 ${ok}`);
+    const reasons = Object.entries(st.skippedReasons || {}).map(([r, n]) => `${r} ${n}`).join('，');
+    const summary = `批量分析完成：成功 ${st.ok}` + (st.fail ? `，失败 ${st.fail}` : '') + (st.skipped ? `，跳过 ${st.skipped}（${reasons}）` : '');
+    if (st.aborted) toast(`${st.aborted}；${summary}`, true);
+    else toast(summary + (st.fail && st.firstErr ? `（${st.firstErr}）` : ''), !!(st.fail || st.skipped));
   } catch (e) {
     toast(e.message, true);
   } finally {
-    uids.forEach((u) => scoring.delete(u));
+    scoring.clear();
+    batchPause = null;
     setBatchBusy(false);
     render();
+  }
+}
+
+async function stopBatch() {
+  try {
+    await send(MSG.BATCH_CANCEL);
+    toast('正在停止批量分析…');
+  } catch (e) {
+    toast(e.message, true);
   }
 }
 
@@ -963,7 +1261,9 @@ function buildDetailedCsv(items) {
     ['城市', (j) => j.city],
     ['区域', (j) => j.district],
     // —— 岗位要求 ——
+    ['工作地址', (j) => j.address],
     ['工作经验', (j) => j.experience],
+    ['JD写明经验', (j) => j.experienceJd],
     ['学历要求', (j) => j.degree],
     ['技能', (j) => joinList(j.skills)],
     ['岗位标签', (j) => joinList(j.tags)],
@@ -976,6 +1276,9 @@ function buildDetailedCsv(items) {
     ['融资阶段', (j) => j.companyStage],
     ['HR', (j) => j.hrName],
     ['HR职位', (j) => j.hrTitle],
+    ['HR活跃', (j) => j.hrActiveText || (j.hrOnline ? '在线' : '')],
+    ['沟通状态', (j) => (j.contacted === 'job' ? '已沟通' : j.contacted === 'company' ? '已沟通该公司' : '')],
+    ['活跃观测时间', (j) => fmtTime(j.hrActiveAt)],
     // —— AI 匹配分析 ——
     ['一句话总评', (j) => (j.match ? j.match.summary : '')],
     ['契合点', (j) => (j.match ? joinList(j.match.reasons) : '')],
@@ -996,6 +1299,10 @@ function buildDetailedCsv(items) {
 
 function joinList(x) {
   return Array.isArray(x) ? x.filter(Boolean).join('、') : x == null ? '' : String(x);
+}
+// 活跃描述是相对时间（如「3日内活跃」），附上观测时刻才有意义
+function hrActiveTitle(job) {
+  return job.hrActiveAt ? `观测于 ${fmtTime(job.hrActiveAt)}` : '';
 }
 function fmtTime(s) {
   if (!s) return '';

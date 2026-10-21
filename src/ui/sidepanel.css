@@ -271,3 +271,15 @@
   display: flex; align-items: center; gap: 8px;
   cursor: pointer;
 }
+
+/* 补详情挂起：原因 + 恢复按钮 */
+.pause-hint { cursor: default; color: var(--orange); background: rgba(255, 149, 0, 0.12); }
+.pause-hint .pause-text { flex: 1; line-height: 1.4; }
+.pause-hint .btn { flex: none; }
+
+/* HR 数月 / 半年未活跃：整卡变淡并加红色左边线，醒目但不抢眼 */
+.job-card.is-stale { opacity: 0.72; border-left: 3px solid var(--red); }
+.job-card.is-stale:hover { opacity: 1; }
+
+/* 同一视图重绘时不重复淡入，避免闪烁 */
+.no-anim .fade-up { animation: none; }

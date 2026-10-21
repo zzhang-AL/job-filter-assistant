@@ -86,7 +86,7 @@ function render() {
     }),
   );
   app.appendChild(
-    toggle('自动分析', '收录后自动 AI 打分（耗 token）', settings.autoScore, async (val) => {
+    toggle('自动分析', '收录后自动补详情并 AI 匹配（耗 token）', settings.autoScore, async (val) => {
       settings = await send(MSG.SETTINGS_SAVE, { patch: { autoScore: val } });
     }),
   );

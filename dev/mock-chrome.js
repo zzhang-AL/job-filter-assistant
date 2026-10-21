@@ -54,6 +54,13 @@
       case 'JOB_STAR_TOGGLE': state.jobs = state.jobs.map(j=>j.uid===msg.uid?{...j,star:!j.star}:j); return state.jobs;
       case 'JOB_DELETE': state.jobs = state.jobs.filter(j=>j.uid!==msg.uid); return state.jobs;
       case 'JOB_CLEAR_REQUEST': state.jobs = []; return state.jobs;
+      case 'JOB_BLOCK': { const ids=new Set(msg.uids||[msg.uid]); state.blocked=[...(state.blocked||[]), ...state.jobs.filter(j=>ids.has(j.uid)).map(j=>({uid:j.uid,platform:j.platform,title:j.title,company:j.company,at:new Date().toISOString()}))]; state.jobs=state.jobs.filter(j=>!ids.has(j.uid)); return { jobs: state.jobs, blocked: state.blocked }; }
+      case 'JOB_UNBLOCK': state.blocked=(state.blocked||[]).filter(b=>b.uid!==msg.uid); return state.blocked;
+      case 'BLOCKED_GET': return state.blocked||[];
+      case 'BLOCKED_CLEAR': state.blocked=[]; return [];
+      case 'CONTACTS_MARK': { const ids=new Set(msg.uids||[msg.uid]); state.jobs=state.jobs.map(j=>ids.has(j.uid)?{...j,contacted:'job'}:j); setTimeout(()=>broadcast({ type:'JOBS_UPDATED' }),0); return { jobs: state.jobs, added: ids.size }; }
+      case 'CONTACTS_REMOVE':
+      case 'CONTACTS_GET': case 'CONTACTS_SYNC': case 'CONTACTS_CLEAR': case 'WORKER_HALT_CLEAR': return { contacts: [{ company:'示例科技', title:'前端', jobId:'' }], companies: 1, syncedAt: Date.now(), halt: null };
       case 'JOB_EXPORT_REQUEST': return { format: msg.format||'json', content: JSON.stringify(state.jobs,null,2), count: state.jobs.length };
       case 'GREETING_SAVE': state.jobs = state.jobs.map(j=>j.uid===msg.uid?{...j,greetingDraft:msg.text}:j); return state.jobs;
       case 'ACTIVE_CONTEXT_REQUEST': return { platform:state.ctx.platform, url:state.ctx.url, jobKey:state.ctx.jobKey, isChat:state.ctx.isChat, platformName: state.ctx.platform==='boss'?'BOSS 直聘':'前程无忧 51job' };
@@ -68,6 +75,7 @@
       case 'AI_RESUME_EXTRACT': return { target:{jobTitles:['产品经理'],cities:['上海'],industries:[]}, basics:{yearsOfExperience:5,education:'硕士'}, capabilities:{skills:['需求分析','Axure'],strengths:['数据驱动'],industryExperience:['金融']}, workSummary:'5年产品经验', projectSummary:'', highlights:['DAU 提升30%'] };
       case 'AI_MATCH_SCORE': { const m={score:76,verdict:'good',eligible:true,blockers:[],dims:{skill:82,experience:70,requirement:75,location:90},reasons:['演示打分','React/TS 与岗位技能吻合'],gaps:['缺少大规模 SSR 经验'],risks:[],summary:'演示总评：技能匹配度较高',greetings:{short:'演示精简开场白',standard:'演示标准开场白',detailed:'演示详细开场白'},greeting:'演示标准开场白',at:new Date().toISOString()}; state.jobs=state.jobs.map(j=>j.uid===msg.uid?{...j,match:m}:j); return m; }
       case 'AI_MATCH_BATCH': return (msg.uids||[]).map(u=>({uid:u,ok:true,score:70}));
+      case 'BATCH_START': case 'BATCH_STATUS': case 'BATCH_CANCEL': { const n=(msg.uids||[]).length; return { running:false, total:n, detail:0, queued:0, scoring:0, ok:n, fail:0, skipped:0, skippedReasons:{}, pendingUids:[] }; }
       case 'AI_TAILOR_RESUME': return {
         matchedSkills:['React','TypeScript','组件库建设','性能优化'],
         missingSkills:['大规模 SSR'],

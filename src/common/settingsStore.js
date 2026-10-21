@@ -1,6 +1,7 @@
 // 设置与 AI 供应商列表的 storage 读写。
 import { STORAGE_KEYS, defaultSettings, defaultFilters } from './constants.js';
 import { sanitizeProviderList } from './ai/providers.js';
+import { sanitizePacing } from './pacing.js';
 
 const SET_KEY = STORAGE_KEYS.settings;
 const PROV_KEY = STORAGE_KEYS.aiProviders;
@@ -11,7 +12,13 @@ export async function loadSettings() {
 }
 export async function saveSettings(patch) {
   const cur = await loadSettings();
-  const next = mergeSettings({ ...cur, ...patch, filters: { ...cur.filters, ...(patch && patch.filters) }, privacy: { ...cur.privacy, ...(patch && patch.privacy) } });
+  const next = mergeSettings({
+    ...cur,
+    ...patch,
+    filters: { ...cur.filters, ...(patch && patch.filters) },
+    privacy: { ...cur.privacy, ...(patch && patch.privacy) },
+    pacing: { ...cur.pacing, ...(patch && patch.pacing) },
+  });
   await chrome.storage.local.set({ [SET_KEY]: next });
   return next;
 }
@@ -19,11 +26,27 @@ export async function saveSettings(patch) {
 export function mergeSettings(input) {
   const d = defaultSettings();
   if (!isObj(input)) return d;
+  // 迁移：
+  //  rev<2：旧版本默认不自动分析，现在改为收录后自动进入「补详情 → AI 匹配」
+  //  rev<3：仍是旧「标准」额度（60/时、300/天，未自定义过）的升到新标准额度
+  const rev = input.settingsRev || 0;
+  const migrated = {};
+  if (rev < 2) migrated.autoScore = true;
+  if (rev < 3) {
+    const p = isObj(input.pacing) ? input.pacing : {};
+    if ((p.hourlyCap == null || p.hourlyCap === 60) && (p.dailyCap == null || p.dailyCap === 300)) {
+      migrated.pacing = { ...p, hourlyCap: d.pacing.hourlyCap, dailyCap: d.pacing.dailyCap };
+    }
+  }
+  if (rev < d.settingsRev) migrated.settingsRev = d.settingsRev;
   return {
     ...d,
     ...input,
+    ...migrated,
     privacy: { ...d.privacy, ...(isObj(input.privacy) ? input.privacy : {}) },
     filters: { ...defaultFilters(), ...(isObj(input.filters) ? input.filters : {}) },
+    pacing: sanitizePacing({ ...d.pacing, ...(isObj(input.pacing) ? input.pacing : {}), ...(migrated.pacing || {}) }),
+    aiConcurrency: clampInt(input.aiConcurrency, d.aiConcurrency, 1, 8),
   };
 }
 
@@ -43,6 +66,11 @@ export async function getActiveProvider() {
   if (!providers.length) return null;
   const byId = providers.find((p) => p.id === settings.activeProviderId);
   return byId || providers[0];
+}
+
+function clampInt(v, def, lo, hi) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : def;
 }
 
 function isObj(x) {

@@ -36,6 +36,27 @@
   background: #30d158;
   box-shadow: 0 0 0 4px rgba(48, 209, 88, 0.16);
 }
+.jobhelper-capture-badge.jh-halted .jh-dot {
+  background: #ff9f0a;
+  box-shadow: 0 0 0 4px rgba(255, 159, 10, 0.18);
+}
+.jobhelper-capture-badge .jh-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+.jobhelper-capture-badge .jh-actions:empty {
+  display: none;
+}
+.jobhelper-capture-badge .jh-actions button {
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: #fff;
+  background: #0071e3;
+  border: 0;
+  border-radius: 980px;
+  cursor: pointer;
+}
 @media (prefers-color-scheme: dark) {
   .jobhelper-capture-badge {
     color: #f5f5f7;

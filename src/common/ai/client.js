@@ -34,7 +34,8 @@ export async function chatJson(providerInput, prompt, opts = {}) {
 export async function testProvider(providerInput, opts = {}) {
   try {
     const text = await chat(providerInput, [{ role: 'user', content: '请只回复两个字：正常' }], {
-      maxTokens: 16,
+      // 不写死 16：推理模型会先用 reasoning_content 吃掉预算，导致正文为空却报「连接成功」，
+      // 这里跟随供应商的 max tokens 配置，使测试结果与真实调用一致。
       temperature: 0,
       signal: opts.signal,
     });

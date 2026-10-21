@@ -3,6 +3,8 @@ import { emptyProfile, scoreProfile, sanitizeProfile, mergeDraft } from '../comm
 import { PRESETS, PROTOCOLS, PROTOCOL_LABELS, providerFromPreset, sanitizeProvider, validateProvider } from '../common/ai/providers.js';
 import { send, h, toast, toList, fromList, debounce } from './ui-common.js';
 import { parseResumeFile } from './resumeParser.js';
+import { PACING_PRESETS } from '../common/pacing.js';
+import { contactKey } from '../common/platforms.js';
 
 const navEl = document.getElementById('nav');
 const mainEl = document.getElementById('main');
@@ -15,6 +17,7 @@ const SECTIONS = [
   { id: 'profile', icon: '👤', label: '个人画像', render: renderProfile },
   { id: 'ai', icon: '🔌', label: 'AI 接口', render: renderAi },
   { id: 'filters', icon: '🧲', label: '岗位筛选', render: renderFilters },
+  { id: 'lists', icon: '🚫', label: '已沟通与屏蔽', render: renderLists },
   { id: 'general', icon: '⚙️', label: '通用与隐私', render: renderGeneral },
 ];
 let current = 'profile';
@@ -579,6 +582,7 @@ function renderFilters() {
     field('排除关键词（命中即剔除）', listBind('keywordsExclude', '如 电销、催收')),
     field('风险词（仅标注不剔除）', listBind('riskKeywords', '如 外包、驻场')),
     field('屏蔽公司（公司名含即剔除）', listBind('excludeCompanies', '公司名关键词')),
+    field('工作地址排除词（地址含即剔除，如驻场在银行）', listBind('addressExclude', '如 银行、软件园')),
   ]);
   mainEl.appendChild(p2);
 
@@ -597,6 +601,15 @@ function renderFilters() {
     field('经验偏好（软提示）', listBind('experience', '如 1-3年')),
     field('学历偏好（软提示）', listBind('degrees', '如 本科')),
   ]);
+  p3.appendChild(
+    h('div', { class: 'set-row' }, [
+      h('div', {}, [
+        h('div', { class: 's-label', text: '剔除 HR 长期未活跃的岗位' }),
+        h('div', { class: 's-desc', text: 'HR 数月 / 半年未活跃的岗位不进入列表（关闭时仍会醒目标注并排在最后）' }),
+      ]),
+      switchEl(!!f.excludeStaleHr, (val) => { f.excludeStaleHr = val; save(); }),
+    ]),
+  );
   mainEl.appendChild(p3);
 }
 
@@ -630,9 +643,21 @@ function renderGeneral() {
   // 抓取行为
   const cap = h('div', { class: 'panel' }, [h('div', { class: 'panel-title', text: '抓取与分析' })]);
   cap.appendChild(setRow('自动收录岗位', '浏览列表时自动抓取', settings.autoCapture, (v) => save({ autoCapture: v })));
-  cap.appendChild(setRow('自动 AI 分析', '新收录岗位自动打分（消耗 token）', settings.autoScore, (v) => save({ autoScore: v })));
+  cap.appendChild(setRow('BOSS 自动补全详情', '滚动列表后在后台标签页逐个打开详情页，读取 JD 与 HR 活跃时间后关闭（插件不直接请求接口；限速，遇验证页自动暂停）', settings.autoFetchDetail, (v) => save({ autoFetchDetail: v })));
+  cap.appendChild(setRow('自动 AI 分析', '收录后自动进入下一步：BOSS 先在后台补全详情（JD + HR 活跃），就绪后立即 AI 匹配（消耗 token）', settings.autoScore, (v) => save({ autoScore: v })));
   cap.appendChild(setRow('列表内显示角标', '页面右下角显示收录状态', settings.showBadge, (v) => save({ showBadge: v })));
   cap.appendChild(setRow('去重', '相同岗位只保留一条', settings.dedupe, (v) => save({ dedupe: v })));
+  const aiInput = h('input', { type: 'number', value: settings.aiConcurrency, min: 1, max: 8, style: 'width:100px' });
+  aiInput.addEventListener('input', () => save({ aiConcurrency: Number(aiInput.value) || 1 }));
+  cap.appendChild(
+    h('div', { class: 'set-row' }, [
+      h('div', {}, [
+        h('div', { class: 's-label', text: 'AI 同时分析数' }),
+        h('div', { class: 's-desc', text: '同时进行的 AI 分析请求数（1-8），自动 / 批量 / 手动合计。受 AI 供应商限流约束，遇到限流会自动暂停 2 分钟' }),
+      ]),
+      aiInput,
+    ]),
+  );
   const maxInput = h('input', { type: 'number', value: settings.maxJobs, style: 'width:100px' });
   maxInput.addEventListener('input', () => save({ maxJobs: Number(maxInput.value) || 800 }));
   cap.appendChild(
@@ -642,6 +667,7 @@ function renderGeneral() {
     ]),
   );
   mainEl.appendChild(cap);
+  mainEl.appendChild(renderPacingPanel());
 
   // 隐私
   const priv = h('div', { class: 'panel' }, [
@@ -684,6 +710,232 @@ async function exportData(format) {
   } catch (e) {
     toast(e.message, true);
   }
+}
+
+// —— 后台标签页节奏（模拟人工操作） ——
+function renderPacingPanel() {
+  const panel = h('div', { class: 'panel' }, [
+    h('div', { class: 'panel-title', text: '后台标签页节奏（模拟人工）' }),
+    h('div', {
+      class: 'panel-desc',
+      text: '补全详情、同步沟通页时打开后台标签页的节奏。所有时长都在区间内随机（多数偏短、偶尔较长），不会固定间隔。你主动点「AI 分析」触发的补全不休息、只用较短间隔。',
+    }),
+  ]);
+  const body = h('div');
+  panel.appendChild(body);
+
+  const savePacing = debounce(async (patch) => {
+    settings = await send(MSG.SETTINGS_SAVE, { patch: { pacing: patch } });
+    drawPresets(); // 只刷新预设高亮，不重绘输入框（否则正在输入时会丢焦点）
+  }, 400);
+
+  function currentPreset() {
+    const p = settings.pacing;
+    for (const [k, v] of Object.entries(PACING_PRESETS)) {
+      if (Object.keys(v).every((f) => f === 'label' || p[f] === v[f])) return k;
+    }
+    return 'custom';
+  }
+
+  function numInput(key, width = 70) {
+    const el = h('input', { type: 'number', value: settings.pacing[key], style: `width:${width}px` });
+    el.addEventListener('input', () => savePacing({ [key]: Number(el.value) }));
+    return el;
+  }
+  function rangeRow(label, desc, kMin, kMax, unit) {
+    return h('div', { class: 'set-row' }, [
+      h('div', {}, [h('div', { class: 's-label', text: label }), h('div', { class: 's-desc', text: desc })]),
+      h('div', { class: 'row', style: 'gap:6px;align-items:center' }, [numInput(kMin), h('span', { text: '–' }), numInput(kMax), h('span', { text: unit })]),
+    ]);
+  }
+
+  const seg = h('div', { class: 'segmented', style: 'margin-bottom:8px' });
+  function drawPresets() {
+    seg.innerHTML = '';
+    const preset = currentPreset();
+    Object.entries(PACING_PRESETS).forEach(([k, v]) => {
+      seg.appendChild(h('button', {
+        class: preset === k ? 'active' : '',
+        text: v.label,
+        onclick: async () => {
+          const { label, ...vals } = v;
+          settings = await send(MSG.SETTINGS_SAVE, { patch: { pacing: vals } });
+          draw();
+        },
+      }));
+    });
+    seg.appendChild(h('button', { class: preset === 'custom' ? 'active' : '', text: '自定义', disabled: true }));
+  }
+
+  function draw() {
+    body.innerHTML = '';
+    drawPresets();
+    body.appendChild(seg);
+
+    body.appendChild(
+      h('div', { class: 'set-row' }, [
+        h('div', {}, [
+          h('div', { class: 's-label', text: '同时打开标签页' }),
+          h('div', { class: 's-desc', text: '同时补几个岗位的详情（1-5）。越多越快，但被平台判定为异常的风险也越高；打开时刻仍会错开' }),
+        ]),
+        h('div', { class: 'row', style: 'gap:6px;align-items:center' }, [numInput('detailConcurrency'), h('span', { text: '个' })]),
+      ]),
+    );
+    body.appendChild(rangeRow('打开间隔', '两次打开之间等待多久（同时开 N 个时，平均间隔约为它的 1/N，最短 1.5 秒）', 'gapMinSec', 'gapMaxSec', '秒'));
+    body.appendChild(rangeRow('页面停留', '读完数据后在页面上停留多久再关（JD 越长停得越久）', 'dwellMinSec', 'dwellMaxSec', '秒'));
+    body.appendChild(rangeRow('每看几个休息一次', '处理了随机若干个之后歇一会儿', 'breakEveryMin', 'breakEveryMax', '个'));
+    body.appendChild(rangeRow('休息时长', '', 'breakMinSec', 'breakMaxSec', '秒'));
+    body.appendChild(
+      h('div', { class: 'set-row' }, [
+        h('div', {}, [h('div', { class: 's-label', text: '上限' }), h('div', { class: 's-desc', text: '每小时 / 每天最多打开的后台标签页数' })]),
+        h('div', { class: 'row', style: 'gap:6px;align-items:center' }, [numInput('hourlyCap'), h('span', { text: '/ 时' }), numInput('dailyCap'), h('span', { text: '/ 天' })]),
+      ]),
+    );
+    const hours = h('input', { type: 'text', value: settings.pacing.activeHours, placeholder: '08:00-23:30', style: 'width:130px' });
+    hours.addEventListener('input', () => savePacing({ activeHours: hours.value }));
+    body.appendChild(
+      h('div', { class: 'set-row' }, [
+        h('div', {}, [h('div', { class: 's-label', text: '活跃时段' }), h('div', { class: 's-desc', text: '只在这个时段内自动运行，如 08:00-23:30；可跨午夜；留空不限' })]),
+        hours,
+      ]),
+    );
+    body.appendChild(setRow('电脑空闲时暂停', '超过 3 分钟没有键盘鼠标操作就暂停，回来后继续', settings.pacing.onlyWhenActive, (v) => savePacing({ onlyWhenActive: v })));
+    body.appendChild(setRow('停留时慢慢滚动', '在详情页停留期间分几次向下滚动，像在阅读', settings.pacing.simulateScroll, (v) => savePacing({ simulateScroll: v })));
+  }
+  draw();
+  return panel;
+}
+
+// ============================================================
+//  已沟通与屏蔽
+// ============================================================
+function renderLists() {
+  mainEl.appendChild(sectionHead('已沟通与屏蔽', '沟通过的岗位不再重复收录和匹配；屏蔽的岗位永久不再收录，清空岗位库也不影响。'));
+  const save = debounce(async (patch) => {
+    settings = await send(MSG.SETTINGS_SAVE, { patch });
+  }, 200);
+
+  // —— 已沟通 ——
+  const cPanel = h('div', { class: 'panel' }, [
+    h('div', { class: 'panel-title', text: '已沟通的公司与岗位' }),
+    h('div', {
+      class: 'panel-desc',
+      text: '来源：BOSS 沟通页（后台标签页打开 /web/geek/chat 读取会话列表后自动关闭，每 12 小时自动同步一次；你自己打开沟通页时也会顺带同步）+ 通过本插件打过招呼的岗位。',
+    }),
+  ]);
+  cPanel.appendChild(setRow('跳过已沟通岗位', '不再收录，批量/自动匹配也跳过', settings.skipContacted, (v) => save({ skipContacted: v })));
+  cPanel.appendChild(setRow('跳过已沟通公司的其他岗位', '沟通过的公司，其其他岗位也不再收录', settings.skipContactedCompanies, (v) => save({ skipContactedCompanies: v })));
+  const cInfo = h('div', { class: 'panel-desc', style: 'margin:12px 0 8px' , text: '加载中…' });
+  const cList = h('div', { class: 'jc-tags' });
+  const syncBtn = h('button', {
+    class: 'btn btn-primary',
+    text: '立即同步',
+    onclick: async () => {
+      syncBtn.disabled = true;
+      syncBtn.textContent = '同步中…';
+      try {
+        const r = await send(MSG.CONTACTS_SYNC);
+        if (r.error) toast(r.error, true);
+        else toast(`同步完成，共 ${r.companies} 家公司`);
+      } catch (e) {
+        toast(e.message, true);
+      }
+      syncBtn.disabled = false;
+      syncBtn.textContent = '立即同步';
+      fillContacts();
+    },
+  });
+  cPanel.appendChild(cInfo);
+  cPanel.appendChild(cList);
+  cPanel.appendChild(
+    h('div', { class: 'row', style: 'gap:10px;flex-wrap:wrap;margin-top:12px' }, [
+      syncBtn,
+      h('button', {
+        class: 'btn btn-danger',
+        text: '清空已沟通记录',
+        onclick: () => showModal({
+          title: '清空已沟通记录？', body: '只清本地记录，不影响 BOSS 上的会话；下次同步会重新获取。', confirmText: '清空', danger: true,
+          onConfirm: async () => { await send(MSG.CONTACTS_CLEAR); toast('已清空'); fillContacts(); },
+        }),
+      }),
+    ]),
+  );
+  mainEl.appendChild(cPanel);
+
+  async function fillContacts() {
+    try {
+      const r = await send(MSG.CONTACTS_GET);
+      const when = r.syncedAt ? new Date(r.syncedAt).toLocaleString('zh-CN', { hour12: false }) : '从未';
+      let text = `共 ${r.contacts.length} 条记录、${r.companies} 家公司 · 上次同步：${when}`;
+      if (r.halt) text += ` · 后台补全已暂停：${r.halt.reason}`;
+      cInfo.textContent = text;
+      if (r.halt) {
+        cInfo.appendChild(h('button', {
+          class: 'btn btn-sm', style: 'margin-left:8px', text: '解除暂停', onclick: async () => { await send(MSG.WORKER_HALT_CLEAR); fillContacts(); },
+        }));
+      }
+      cList.innerHTML = '';
+      const SRC = { chat: '沟通页', greeting: '插件打招呼', manual: '手动标记' };
+      r.contacts.slice(-80).reverse().forEach((c) => {
+        cList.appendChild(
+          h('span', { class: 'chip', title: `来源：${SRC[c.source] || c.source || '未知'}` }, [
+            [c.company, c.title].filter(Boolean).join(' · ') || c.hrName,
+            h('span', {
+              class: 'x',
+              text: ' ×',
+              title: '删除这条记录（撤销已沟通）',
+              onclick: async () => {
+                await send(MSG.CONTACTS_REMOVE, { key: contactKey(c) });
+                fillContacts();
+              },
+            }),
+          ]),
+        );
+      });
+    } catch (e) {
+      cInfo.textContent = e.message;
+    }
+  }
+  fillContacts();
+
+  // —— 屏蔽名单 ——
+  const bPanel = h('div', { class: 'panel' }, [
+    h('div', { class: 'panel-title', text: '屏蔽的岗位' }),
+    h('div', { class: 'panel-desc', text: '在侧边栏点 🚫 屏蔽的岗位。解除后再次浏览到时会重新收录。' }),
+  ]);
+  const bList = h('div');
+  bPanel.appendChild(bList);
+  mainEl.appendChild(bPanel);
+
+  async function fillBlocked() {
+    const list = await send(MSG.BLOCKED_GET).catch(() => []);
+    bList.innerHTML = '';
+    if (!list.length) {
+      bList.appendChild(h('div', { class: 'panel-desc', text: '暂无屏蔽的岗位' }));
+      return;
+    }
+    list.forEach((b) => {
+      bList.appendChild(
+        h('div', { class: 'set-row' }, [
+          h('div', {}, [
+            h('div', { class: 's-label', text: b.title || b.uid }),
+            h('div', { class: 's-desc', text: [b.company, b.platform === 'boss' ? 'BOSS' : '51job', new Date(b.at).toLocaleDateString('zh-CN')].filter(Boolean).join(' · ') }),
+          ]),
+          h('button', { class: 'btn btn-sm', text: '解除', onclick: async () => { await send(MSG.JOB_UNBLOCK, { uid: b.uid }); fillBlocked(); } }),
+        ]),
+      );
+    });
+    bList.appendChild(
+      h('button', {
+        class: 'btn btn-danger', style: 'margin-top:12px', text: '全部解除',
+        onclick: () => showModal({
+          title: '解除全部屏蔽？', body: `将解除 ${list.length} 个岗位的屏蔽。`, confirmText: '解除', danger: true,
+          onConfirm: async () => { await send(MSG.BLOCKED_CLEAR); fillBlocked(); },
+        }),
+      }),
+    );
+  }
+  fillBlocked();
 }
 
 // ============================================================

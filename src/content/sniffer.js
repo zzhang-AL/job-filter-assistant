@@ -23,6 +23,10 @@
       if (/\/wapi\/zpgeek\/(search\/joblist|pc\/recommend\/job\/list|mobile\/search\/joblist|job\/detail(?:\/[a-z]+)?|job\/card|geek\/job\/detail)\.json/.test(path)) {
         return 'boss';
       }
+      // 沟通页：会话列表 / 会话详情（用于识别已沟通过的公司与岗位）
+      if (/\/wapi\/zprelation\/friend\/[\w/]+\.json|\/wapi\/zpchat\/geek\/getBossData\.json/.test(path)) {
+        return 'boss';
+      }
     }
     if (/(^|\.)51job\.com$/i.test(host)) {
       if (/\/api\/job\/(search-(pc|h5)|detail)/.test(path)) return 'qcwy';

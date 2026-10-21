@@ -8,6 +8,11 @@
     PAGE_CONTEXT_CHANGED: 'PAGE_CONTEXT_CHANGED',
     SEND_GREETING: 'SEND_GREETING',
     CURRENT_JOB: 'CURRENT_JOB',
+    CONTACTS_CAPTURED: 'CONTACTS_CAPTURED',
+    TAB_ROLE: 'TAB_ROLE',
+    WORKER_RESULT: 'WORKER_RESULT',
+    DETAIL_PROGRESS: 'DETAIL_PROGRESS',
+    WORKER_HALT_CLEAR: 'WORKER_HALT_CLEAR',
   };
 
   // 判断嗅探到的 URL 是「列表」还是「岗位详情/卡片」
@@ -18,6 +23,7 @@
     } catch {
       return 'list';
     }
+    if (/\/wapi\/zprelation\/friend\/|\/wapi\/zpchat\/geek\/getBossData\.json/.test(path)) return 'contacts';
     if (/\/wapi\/zpgeek\/(job\/detail(?:\/[a-z]+)?|job\/card|geek\/job\/detail)\.json/.test(path)) return 'detail';
     if (/\/api\/job\/detail/.test(path)) return 'detail';
     return 'list';
@@ -55,6 +61,15 @@
       chrome.runtime.sendMessage({ type, ...extra }).catch(() => {});
     } catch {}
   }
+  // 需要 background 回包时用它；失败返回 null
+  async function request(type, extra) {
+    try {
+      const res = await chrome.runtime.sendMessage({ type, ...extra });
+      return res && res.ok ? res.data : null;
+    } catch {
+      return null;
+    }
+  }
 
   let captured = 0;
 
@@ -63,7 +78,17 @@
     if (ev.source !== window) return;
     const d = ev.data;
     if (!d || d.source !== CHANNEL) return;
-    if (apiKind(d.url) === 'detail') {
+    // 页面请求多用相对地址，转成完整地址再交给后台（后台据此判断是不是列表接口，决定是否自动补详情 / 匹配）
+    try {
+      d.url = new URL(d.url, location.href).href;
+    } catch {}
+    const kind = apiKind(d.url);
+    if (kind === 'contacts') {
+      // 沟通页会话列表：交给 background 解析出已沟通的公司/岗位
+      send(MSG.CONTACTS_CAPTURED, { platform: d.platform, payload: d.payload });
+      return;
+    }
+    if (kind === 'detail') {
       // 点开某个岗位：上报「当前岗位」，让面板实时切换
       const jobKey = jobKeyFromDetail(d.url, d.payload);
       if (jobKey) send(MSG.CURRENT_JOB, { platform: d.platform, jobKey });
@@ -71,7 +96,10 @@
       send(MSG.JOBS_CAPTURED, { platform: d.platform, url: d.url, payload: d.payload });
       return;
     }
-    if (d.platform === 'boss') recordBossOnline(d.payload); // 记录每个岗位的 HR 在线状态
+    if (d.platform === 'boss') {
+      recordBossOnline(d.payload); // 记录每个岗位的 HR 在线状态
+      recordListMeta(d.payload); // 记录岗位 → 公司/岗位名，用于隐藏已沟通的卡片
+    }
     send(MSG.JOBS_CAPTURED, { platform: d.platform, url: d.url, payload: d.payload });
     captured++;
     flashBadge();
@@ -134,19 +162,39 @@
     if (badgeEl) return badgeEl;
     badgeEl = document.createElement('div');
     badgeEl.className = 'jobhelper-capture-badge';
-    badgeEl.innerHTML = '<span class="jh-dot"></span><span class="jh-text">已收录 0</span>';
+    badgeEl.innerHTML = '<span class="jh-dot"></span><span class="jh-text">已收录 0</span><span class="jh-actions"></span>';
     badgeEl.addEventListener('click', () => {
       send('OPEN_SIDEPANEL', {});
+    });
+    // 补全挂起时的按钮：不触发角标本身的点击
+    badgeEl.querySelector('.jh-actions').addEventListener('click', (e) => {
+      const act = e.target && e.target.dataset ? e.target.dataset.act : '';
+      if (!act) return;
+      e.stopPropagation();
+      if (act === 'login') window.open('https://www.zhipin.com/web/user/?ka=header-login', '_blank');
+      else if (act === 'resume') send(MSG.WORKER_HALT_CLEAR, {});
     });
     (document.body || document.documentElement).appendChild(badgeEl);
     return badgeEl;
   }
   function flashBadge() {
     const el = ensureBadge();
-    el.querySelector('.jh-text').textContent = `已收录 ${captured} 次`;
+    const halted = detailProgress.halted;
+    let text = `已收录 ${captured} 次`;
+    if (halted) {
+      const min = Math.ceil(((detailProgress.resumeAt || 0) - Date.now()) / 60000);
+      text += ` · 详情补全已暂停${min > 0 ? `（约 ${min} 分钟后继续）` : ''}`;
+    } else if (detailProgress.done || detailProgress.pending) text += ` · 详情 ${detailProgress.done}/${detailProgress.done + detailProgress.pending}`;
+    el.querySelector('.jh-text').textContent = text;
+    el.querySelector('.jh-actions').innerHTML = halted
+      ? (/未登录/.test(halted) ? '<button data-act="login">去登录</button>' : '') + '<button data-act="resume">继续</button>'
+      : '';
+    el.title = halted || '';
+    el.classList.toggle('jh-halted', !!halted);
     el.classList.add('jh-active');
     clearTimeout(badgeTimer);
-    badgeTimer = setTimeout(() => el.classList.remove('jh-active'), 1600);
+    // 挂起时一直显示，方便直接点「继续 / 去登录」
+    if (!halted) badgeTimer = setTimeout(() => el.classList.remove('jh-active'), 1600);
   }
 
   // —— DOM 兜底：当接口嗅探长时间未命中时，从可见卡片粗略抓取 ——
@@ -226,6 +274,151 @@
   if (PLATFORM) {
     setTimeout(domFallback, 6000); // 给接口嗅探留出时间，再兜底
   }
+
+  // ============================================================
+  //  后台标签页协作（插件不直接向平台发请求）
+  //  background 为补全详情 / 同步已沟通，会在后台打开真实页面；本脚本在这些页面里
+  //  读取页面自己加载出来的数据，回报后由 background 关闭标签页。
+  //  普通浏览时同样会读取（用户自己打开详情页 / 沟通页也能顺带补全）。
+  // ============================================================
+  let tabRole = null; // 'detail' | 'contacts' | null（null = 用户自己打开的页面）
+  const detailProgress = { done: 0, pending: 0, halted: '', resumeAt: 0 };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== MSG.DETAIL_PROGRESS) return false;
+    detailProgress.done = msg.done || 0;
+    detailProgress.pending = msg.pending || 0;
+    detailProgress.halted = msg.halted || '';
+    detailProgress.resumeAt = msg.resumeAt || 0;
+    flashBadge();
+    return false;
+  });
+
+  // 平台的安全验证 / 登录页：后台任务遇到它必须立即停下
+  function detectBlockedPage() {
+    const p = location.pathname;
+    if (/\/web\/user\/(safe|verify)|verify-slider|security-check|\/web\/passport/i.test(p)) return 'verify';
+    if (/^\/web\/user\/?$/.test(p) || /[?&]ka=header-login/.test(location.search)) return 'login';
+    const t = (document.body && document.body.innerText || '').slice(0, 400);
+    if (/安全验证|异常访问|访问行为异常/.test(t)) return 'verify';
+    return '';
+  }
+
+  // 详情页上弹出的登录框（未登录时 BOSS 可能不跳转、而是盖一层登录弹窗）。只在读不到 JD 时调用，避免误判
+  function detectLoginPrompt() {
+    const boxes = document.querySelectorAll('[class*="login-dialog"], [class*="login-box"], [class*="sign-form"], [class*="login-wrap"], .boss-login-dialog');
+    for (const el of boxes) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 120 || r.height < 120) continue;
+      if (/登录|注册/.test(el.innerText || '')) return true;
+    }
+    return /(扫码登录|验证码登录|密码登录)/.test((document.body && document.body.innerText || '').slice(0, 3000));
+  }
+
+  // —— 岗位详情页：读取 JD 正文与 HR 活跃时间 ——
+  // 独立详情页 /job_detail/<id>.html 为服务端渲染，JD 在 .job-sec-text，活跃时间在 .boss-active-time。
+  async function scrapeDetailPage() {
+    const m = location.pathname.match(/job_detail\/([\w-]+)\.html/);
+    if (!m) return null;
+    const jdEl = await waitFor(() => document.querySelector('.job-detail-section .job-sec-text, .job-sec-text'), 12000, 400);
+    if (!jdEl) {
+      // 读不到 JD：页面可能后来才跳到验证 / 登录，或在详情页上弹了登录框——这些要熔断，不算这个岗位读取失败
+      const blocked = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
+      return blocked ? { jobKey: m[1], ok: false, blocked } : { jobKey: m[1], ok: false, noJd: true };
+    }
+    // HR 活跃区块可能比 JD 晚渲染：再等一会儿（在线的 HR 只有在线标记、没有活跃时间文字）
+    await waitFor(() => document.querySelector('.boss-active-time, .boss-online-tag'), 3000, 300);
+    const active = document.querySelector('.boss-active-time');
+    const online = !!document.querySelector('.boss-online-tag');
+    const addrEl = document.querySelector('.location-address, .job-location .location-address');
+    // 详情页顶部的经验 / 学历要求（BOSS 的 class 原文即拼作 text-experiece）
+    const expEl = document.querySelector('.job-banner .text-experiece, .job-banner .text-experience, .text-experiece');
+    const degEl = document.querySelector('.job-banner .text-degree, .text-degree');
+    const payload = {
+      code: 0,
+      zpData: {
+        jobInfo: {
+          encryptId: m[1],
+          postDescription: (jdEl.innerText || jdEl.textContent || '').trim(),
+          address: addrEl ? addrEl.textContent.trim() : '',
+          experienceName: expEl ? expEl.textContent.trim() : '',
+          degreeName: degEl ? degEl.textContent.trim() : '',
+        },
+        bossInfo: {
+          activeTimeDesc: active ? active.textContent.trim() : '',
+          bossOnline: online,
+        },
+      },
+    };
+    send(MSG.JOBS_CAPTURED, { platform: 'boss', url: location.href.split('#')[0] + '#dom-detail', payload, jobKey: m[1] });
+    return { jobKey: m[1], ok: true, textLength: payload.zpData.jobInfo.postDescription.length };
+  }
+
+  // —— 沟通页：DOM 兜底读取会话列表里的公司名（接口嗅探为主）——
+  // 会话项结构：.name-box 内依次为 HR 名 / 公司名 / HR 职位。
+  function scrapeChatList() {
+    const out = [];
+    document.querySelectorAll('.user-list li .name-box, [class*="user-list"] [class*="name-box"]').forEach((box) => {
+      const spans = Array.from(box.querySelectorAll('span')).map((x) => x.textContent.trim()).filter(Boolean);
+      if (spans.length >= 2) out.push({ hrName: spans[0], company: spans[1] });
+    });
+    return out;
+  }
+
+  async function runChatPage() {
+    await waitFor(() => document.querySelector('.user-list li, [class*="user-list"] li'), 10000, 400);
+    await sleep(1500); // 等会话列表接口响应落地
+    const entries = scrapeChatList();
+    if (entries.length) send(MSG.CONTACTS_CAPTURED, { platform: 'boss', entries });
+    return { ok: true, count: entries.length };
+  }
+
+  // 后台任务页读完数据后，像人一样在页面上停留一会儿再关；详情页按 JD 长度多看几秒，并分几次慢慢往下滚
+  async function humanDwell(task, textLength = 0) {
+    if (!task || !task.dwellMs) return;
+    const ms = Math.min(task.dwellMaxMs || task.dwellMs, task.dwellMs + Math.min(6000, textLength * 5));
+    const end = Date.now() + ms;
+    if (task.scroll) {
+      const steps = 2 + Math.floor(Math.random() * 4);
+      for (let i = 0; i < steps && Date.now() < end; i++) {
+        const slot = (end - Date.now()) / (steps - i);
+        await sleep(slot * (0.5 + Math.random() * 0.8));
+        try {
+          window.scrollBy({ top: 150 + Math.random() * 450, behavior: 'smooth' });
+        } catch {}
+      }
+    }
+    const rest = end - Date.now();
+    if (rest > 0) await sleep(rest);
+  }
+
+  async function initPageRole() {
+    if (PLATFORM !== 'boss') return;
+    const task = await request(MSG.TAB_ROLE, {});
+    tabRole = task && task.role ? task.role : null;
+    const blocked = detectBlockedPage();
+    if (blocked) {
+      if (tabRole) send(MSG.WORKER_RESULT, { role: tabRole, ok: false, blocked });
+      return;
+    }
+    if (/\/job_detail\//.test(location.pathname)) {
+      const res = await scrapeDetailPage();
+      if (tabRole === 'detail') {
+        if (res && res.ok) await humanDwell(task, res.textLength || 0);
+        send(MSG.WORKER_RESULT, { role: 'detail', ...(res || { ok: false }) });
+      }
+    } else if (detectChat()) {
+      const res = await runChatPage();
+      if (tabRole === 'contacts') {
+        await humanDwell(task);
+        send(MSG.WORKER_RESULT, { role: 'contacts', ...res });
+      }
+    } else if (tabRole) {
+      send(MSG.WORKER_RESULT, { role: tabRole, ok: false });
+    }
+  }
+  initPageRole().catch(() => {});
 
   // ============================================================
   //  一键发送招呼语：DOM 自动化（等价于用户手动在聊天框打字并点发送）
@@ -353,6 +546,9 @@
   async function consumePendingGreetingOnChatPage() {
     if (pendingConsumed || !detectChat()) return;
     pendingConsumed = true; // 同步占位，避免 init 与 MutationObserver 并发导致重复填入
+    // 后台同步用的沟通页不能抢走用户前台打招呼的暂存招呼语（占位不释放，本页不再尝试）
+    const role = await request(MSG.TAB_ROLE, {});
+    if (role && role.role) return;
     // 先等输入框出现，再取 pending：直接进聊天页时会话未选中、输入框可能延迟或不渲染，
     // 若先取走 pending 再等，渲染失败就把招呼语弄丢了。等到输入框才消费，更稳。
     const input = await waitFor(findChatInput, 10000);
@@ -452,6 +648,7 @@
     reapplyTimer = setTimeout(() => {
       ensureFreshButton();
       if (freshOn) applyFreshSort();
+      applyHiddenCards();
     }, 300);
   }
 
@@ -580,6 +777,97 @@
     return best && score >= 3 ? best.lastElementChild : null;
   }
 
+  // ============================================================
+  //  BOSS 列表页：隐藏已屏蔽 / 已沟通的岗位卡片
+  //  只改本页 DOM 的显示，不发请求、不改平台数据；规则与收录一致（读同一份 storage）。
+  // ============================================================
+  const STORE = { settings: 'jobHelperSettingsV1', blocked: 'jobHelperBlockedV1', contacts: 'jobHelperContactsV1' };
+  const listMeta = new Map(); // encryptJobId -> { company, title }
+  let hideRules = null;
+
+  function recordListMeta(payload) {
+    try {
+      const zp = payload && payload.zpData;
+      const list = zp && (zp.jobList || zp.recommendJobList);
+      if (!Array.isArray(list)) return;
+      for (const j of list) {
+        const id = j && (j.encryptJobId || j.jobId);
+        if (id) listMeta.set(String(id), { company: String(j.brandName || ''), title: String(j.jobName || '') });
+      }
+    } catch {}
+  }
+
+  // 与 common/platforms.js 的 normCompany / contactStatus 保持一致（此处为独立副本）
+  const normCompany = (s) => String(s || '').trim().replace(/\s+/g, '').replace(/（/g, '(').replace(/）/g, ')').toLowerCase();
+
+  function loadHideRules() {
+    try {
+      chrome.storage.local.get([STORE.settings, STORE.blocked, STORE.contacts], (got) => {
+        const st = got[STORE.settings] || {};
+        const blocked = new Set();
+        for (const b of got[STORE.blocked] || []) {
+          if (b && typeof b.uid === 'string' && b.uid.startsWith('boss:')) blocked.add(b.uid.slice(5));
+        }
+        const jobIds = new Set();
+        const pairs = new Set();
+        const companies = new Set();
+        for (const c of got[STORE.contacts] || []) {
+          if (!c) continue;
+          if (c.jobId) jobIds.add(c.jobId);
+          const co = normCompany(c.company);
+          if (co) {
+            companies.add(co);
+            if (c.title) pairs.add(`${co}|${String(c.title).trim()}`);
+          }
+        }
+        hideRules = {
+          blocked, jobIds, pairs, companies,
+          skipContacted: st.skipContacted !== false,
+          skipCompanies: st.skipContactedCompanies !== false,
+        };
+        applyHiddenCards();
+      });
+    } catch {}
+  }
+
+  function cardShouldHide(id, meta) {
+    const r = hideRules;
+    if (!r) return false;
+    if (id && r.blocked.has(id)) return true;
+    if (!r.skipContacted) return false;
+    if (id && r.jobIds.has(id)) return true;
+    const co = normCompany(meta.company);
+    if (!co) return false;
+    if (r.pairs.has(`${co}|${meta.title.trim()}`)) return true;
+    return r.skipCompanies && r.companies.has(co);
+  }
+
+  function applyHiddenCards() {
+    if (PLATFORM !== 'boss' || !hideRules) return;
+    document.querySelectorAll('.job-card-wrap, li.job-card-box, .job-card-wrapper').forEach((card) => {
+      const row = card.closest('li') || card;
+      const a = card.querySelector('a[href*="job_detail"]') || (card.matches('a[href*="job_detail"]') ? card : null);
+      const m = a && a.getAttribute('href').match(/job_detail\/([\w-]+)\.html/);
+      const id = m ? m[1] : '';
+      const meta = listMeta.get(id) || {
+        company: txt(card, '.boss-name') || txt(card, '.company-name'),
+        title: txt(card, '.job-name') || txt(card, '.job-title'),
+      };
+      row.classList.toggle('jh-hidden-row', cardShouldHide(id, meta));
+    });
+  }
+
+  if (PLATFORM === 'boss') {
+    loadHideRules();
+    // 侧边栏里屏蔽 / 同步了已沟通 / 改了设置：立即刷新本页卡片
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local') return;
+        if (changes[STORE.settings] || changes[STORE.blocked] || changes[STORE.contacts]) loadHideRules();
+      });
+    } catch {}
+  }
+
   function injectFreshStyles() {
     if (document.getElementById('jh-fresh-style')) return;
     const css = `
@@ -593,6 +881,7 @@
       .jh-fresh-btn.jh-floating{position:fixed;top:120px;right:20px;z-index:99998;
         box-shadow:0 4px 16px rgba(0,0,0,.12);background:#fff;}
       .jh-fresh-btn.jh-floating.jh-on{background:#00a6a7;color:#fff;}
+      .jh-hidden-row{display:none !important;}
       .jh-fresh-row{position:relative;}
       .jh-fresh-row::after{content:"HR活跃";position:absolute;top:8px;right:8px;z-index:2;
         font-size:11px;font-weight:600;color:#00a6a7;background:rgba(0,166,167,0.12);

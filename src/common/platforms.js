@@ -6,13 +6,17 @@ import { PLATFORM } from './constants.js';
 // { uid, platform, jobId, title, salaryText, salaryMinK, salaryMaxK,
 //   city, district, experience, degree, skills[], tags[], welfare[],
 //   company, companyIndustry, companyScale, companyType, companyStage,
-//   hrName, hrTitle, description, url, publishedAt, raw{关键凭据}, savedAt }
+//   hrName, hrTitle, hrOnline, hrActiveText, hrActiveAt, address, description, url, publishedAt,
+//   raw{关键凭据}, savedAt }
 
 // —— URL 判定：命中即认为是可嗅探的岗位列表/详情接口 ——
-export function matchPlatformApi(urlStr) {
+// 页面请求常用相对地址（如 /wapi/zpgeek/search/joblist.json），platformHint 给出所在平台，用它的域名补全；
+// 没有提示时无法判断来源，相对地址一律不认。
+const PLATFORM_ORIGIN = { [PLATFORM.boss]: 'https://www.zhipin.com', [PLATFORM.qcwy]: 'https://we.51job.com' };
+export function matchPlatformApi(urlStr, platformHint) {
   let u;
   try {
-    u = new URL(urlStr, 'https://x');
+    u = new URL(urlStr, PLATFORM_ORIGIN[platformHint] || 'https://x');
   } catch {
     return null;
   }
@@ -45,6 +49,7 @@ export function platformOfHost(host = '') {
 
 // —— 解析入口：给定平台 + 原始响应，返回归一化岗位数组 ——
 // opts.url：详情接口的请求 URL；用于从 query 取 encryptJobId，保证 uid 与「当前岗位」信号一致。
+// opts.jobKey：调用方已知的岗位标识（详情补全队列按 securityId 请求，URL 里没有 encryptJobId）。
 export function normalizeResponse(platform, payload, opts = {}) {
   try {
     if (platform === PLATFORM.boss) return normalizeBoss(payload, opts);
@@ -74,9 +79,15 @@ function normalizeBoss(payload, opts = {}) {
   const zp = payload.zpData || {};
   const list = zp.jobList || zp.recommendJobList || (Array.isArray(zp) ? zp : []);
   if (Array.isArray(list) && list.length) return list.map(bossJob).filter(Boolean);
+  const urlKey = str(opts.jobKey) || jobKeyFromUrl(opts.url);
   // 详情接口：无 jobList，改为 zpData.jobInfo（+ brandComInfo/bossInfo）单条
   if (zp.jobInfo) {
-    const one = bossDetailJob(zp, jobKeyFromUrl(opts.url));
+    const one = bossDetailJob(zp, urlKey);
+    return one ? [one] : [];
+  }
+  // 悬停卡片接口 job/card.json：zpData.jobCard 单条，同样带 JD 与 HR 活跃时间
+  if (zp.jobCard) {
+    const one = bossCardJob(zp.jobCard, urlKey);
     return one ? [one] : [];
   }
   return [];
@@ -107,6 +118,10 @@ function bossDetailJob(zp, urlKey = '') {
     district: joinNonEmpty([info.areaDistrict, info.businessDistrict], '·'),
     experience: str(info.experienceName) || str(info.jobExperience),
     degree: str(info.degreeName) || str(info.jobDegree),
+    // 详情的经验 / 学历要求比列表标签更准：打标后，之后再从列表收录到同一岗位也不覆盖
+    experienceFrom: str(info.experienceName) || str(info.jobExperience) ? 'detail' : '',
+    degreeFrom: str(info.degreeName) || str(info.jobDegree) ? 'detail' : '',
+    experienceJd: extractExperienceFromJd(str(info.postDescription) || str(info.jobDesc) || str(info.postDesc)),
     skills: arrStr(info.showSkills) || arrStr(info.skills),
     tags: arrStr(info.jobLabels),
     welfare: arrStr(brand.welfareList) || arrStr(info.welfareList),
@@ -116,6 +131,8 @@ function bossDetailJob(zp, urlKey = '') {
     companyStage: str(brand.stageName) || str(brand.brandStageName),
     hrName: str(boss.name) || str(boss.bossName),
     hrTitle: str(boss.title) || str(boss.bossTitle),
+    ...bossActive(boss.activeTimeDesc, boss.bossOnline),
+    address: str(info.address) || str(info.locationAddress), // 详细工作地址（列表接口只有区/商圈）
     description: str(info.postDescription) || str(info.jobDesc) || str(info.postDesc),
     url: jobId ? `https://www.zhipin.com/job_detail/${jobId}.html` : '',
     raw: {
@@ -126,6 +143,35 @@ function bossDetailJob(zp, urlKey = '') {
   };
   // 剔除空值，避免覆盖列表已有数据（uid/platform/jobId 始终保留）
   return pruneEmpty(full, ['uid', 'platform', 'jobId']);
+}
+
+// 悬停卡片（job/card.json）：字段平铺在 jobCard 上，规则同详情——只回填非空字段
+function bossCardJob(c, urlKey = '') {
+  const jobId = str(urlKey) || str(c.encryptJobId) || str(c.encryptId);
+  if (!jobId) return null;
+  return pruneEmpty({
+    uid: `${PLATFORM.boss}:${jobId}`,
+    platform: PLATFORM.boss,
+    jobId,
+    title: str(c.jobName),
+    hrName: str(c.bossName),
+    hrTitle: str(c.bossTitle),
+    ...bossActive(c.activeTimeDesc, c.online),
+    address: str(c.address),
+    description: str(c.postDescription),
+    experienceJd: extractExperienceFromJd(str(c.postDescription)),
+  }, ['uid', 'platform', 'jobId']);
+}
+
+// HR 活跃状态：activeTimeDesc 形如「刚刚活跃 / 3日内活跃 / 本月活跃」；在线时可能为空，用「在线」补位。
+// hrActiveAt 记录观测时间——活跃描述是相对时间，脱离观测时刻就没意义。
+function bossActive(desc, online) {
+  const text = str(desc) || (online === true ? '在线' : '');
+  return {
+    hrOnline: typeof online === 'boolean' ? online : undefined,
+    hrActiveText: text,
+    hrActiveAt: text ? new Date().toISOString() : '',
+  };
 }
 
 // 去掉空字符串、空数组、null/undefined 的字段（keep 列表里的键无条件保留）
@@ -178,6 +224,7 @@ function bossJob(o) {
     companyStage: str(o.brandStageName),
     hrName: str(o.bossName),
     hrTitle: str(o.bossTitle),
+    hrOnline: !!o.bossOnline, // 列表只有在线布尔值，具体活跃时间需详情接口
     description: '', // BOSS 列表不含 JD 正文，需详情接口
     url,
     publishedAt: '',
@@ -188,6 +235,97 @@ function bossJob(o) {
       lid: str(o.lid),
     },
   };
+}
+
+// 从 JD 正文里找明确写出的经验年限要求，如「3年以上」「3-5年」「五年及以上」。
+// 只认紧挨「经验 / 工作 / 开发」等字样的说法，「优先 / 加分」这种软要求不算；找不到返回空串。
+const CN_NUM = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+export function extractExperienceFromJd(text) {
+  const s = str(text);
+  if (!s) return '';
+  const n = '(\\d+(?:\\.\\d+)?|[一二两三四五六七八九十])';
+  const re = new RegExp(`${n}\\s*(?:[-~至到]\\s*${n}\\s*)?年(以上|及以上|或以上)?[^，。；;,\\n]{0,12}?(经验|工作|开发|从业)`, 'g');
+  let m;
+  while ((m = re.exec(s))) {
+    // 同一句里带「优先 / 加分」的是软要求
+    const tail = s.slice(m.index, m.index + m[0].length + 8);
+    if (/优先|加分|更佳|最好/.test(tail)) continue;
+    const v = (x) => (x in CN_NUM ? CN_NUM[x] : Number(x));
+    const a = v(m[1]);
+    if (!(a > 0 && a <= 20)) continue;
+    if (m[2]) return `${a}-${v(m[2])}年`;
+    return m[3] ? `${a}年以上` : `${a}年`;
+  }
+  return '';
+}
+
+// ============ BOSS 沟通页：已沟通的公司/岗位 ============
+// 沟通页会话列表（/wapi/zprelation/friend/*）与会话详情（/wapi/zpchat/geek/getBossData）的响应。
+// 各接口结构不一，这里宽松地在 zpData 里找「带公司名或岗位 ID 的对象」，每个视作一条沟通记录。
+export function extractBossContacts(payload) {
+  if (!isObj(payload) || (payload.code !== 0 && payload.code !== '0')) return [];
+  const out = [];
+  const seen = new Set();
+  const visit = (node, depth) => {
+    if (depth > 4 || node == null) return;
+    if (Array.isArray(node)) {
+      node.forEach((x) => visit(x, depth + 1));
+      return;
+    }
+    if (!isObj(node)) return;
+    const company = str(node.brandName) || str(node.companyName) || str(node.brandComName) || str(node.comName);
+    const jobId = str(node.encryptJobId) || str(node.jobEncryptId);
+    if (company || jobId) {
+      const c = { jobId, title: str(node.jobName) || str(node.positionName), company, hrName: str(node.name) || str(node.bossName) };
+      const key = contactKey(c);
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        out.push(c);
+      }
+    }
+    for (const v of Object.values(node)) if (typeof v === 'object') visit(v, depth + 1);
+  };
+  visit(payload.zpData, 0);
+  return out;
+}
+
+// 公司名归一：去空白、全角括号统一、小写，用于跨接口精确比对
+export function normCompany(s) {
+  return str(s).replace(/\s+/g, '').replace(/（/g, '(').replace(/）/g, ')').toLowerCase();
+}
+
+export function contactKey(c) {
+  if (!c) return '';
+  if (c.jobId) return `job:${c.jobId}`;
+  const co = normCompany(c.company);
+  if (!co) return '';
+  return c.title ? `pair:${co}|${str(c.title)}` : `co:${co}`;
+}
+
+// 由沟通记录建索引，供收录/匹配时快速判定
+export function buildContactIndex(contacts) {
+  const jobIds = new Set();
+  const pairs = new Set();
+  const companies = new Set();
+  for (const c of Array.isArray(contacts) ? contacts : []) {
+    if (c.jobId) jobIds.add(c.jobId);
+    const co = normCompany(c.company);
+    if (co) {
+      companies.add(co);
+      if (c.title) pairs.add(`${co}|${str(c.title)}`);
+    }
+  }
+  return { jobIds, pairs, companies };
+}
+
+// 岗位的沟通状态：'job' = 沟通过这个岗位；'company' = 沟通过这家公司的其他岗位；'' = 未沟通
+export function contactStatus(job, idx) {
+  if (!job || !idx) return '';
+  if (job.jobId && idx.jobIds.has(job.jobId)) return 'job';
+  const co = normCompany(job.company);
+  if (!co) return '';
+  if (idx.pairs.has(`${co}|${str(job.title)}`)) return 'job';
+  return idx.companies.has(co) ? 'company' : '';
 }
 
 // ============ 前程无忧 51job ============
@@ -236,6 +374,7 @@ function qcwyJob(o) {
     hrName: str(o.hrName),
     hrTitle: str(o.hrPosition),
     description: str(o.jobDescribe), // 51job 列表直接带完整 JD
+    experienceJd: extractExperienceFromJd(str(o.jobDescribe)),
     url: str(o.jobHref),
     publishedAt: str(o.issueDateString) || str(o.confirmDateString),
     raw: {

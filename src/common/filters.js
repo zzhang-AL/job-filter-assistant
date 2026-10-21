@@ -1,4 +1,5 @@
-// 本地岗位筛选（不消耗 AI）：关键词、薪资、城市、经验、学历、屏蔽公司、风险词标注。
+// 本地岗位筛选（不消耗 AI）：关键词、薪资、城市、工作地址、经验、学历、屏蔽公司、HR 活跃度、风险词标注。
+import { isStaleHr } from './activity.js';
 // 用于在 AI 打分之前先粗筛，或在列表里即时过滤。
 
 // 对单个岗位应用筛选，返回 { keep, matchedInclude[], matchedExclude[], risks[], reasons[] }
@@ -14,6 +15,21 @@ export function evaluateJob(job, filters) {
       result.keep = false;
       result.reasons.push(`公司被屏蔽：${c}`);
     }
+  }
+
+  // 工作地址排除词：详细地址 + 区 / 商圈都查（BOSS 详细地址要补全详情后才有）
+  const addr = [job.address, job.city, job.district].filter(Boolean).join(' ').toLowerCase();
+  for (const kw of arr(f.addressExclude)) {
+    if (kw && addr.includes(kw.toLowerCase())) {
+      result.keep = false;
+      result.reasons.push(`工作地址含「${kw}」`);
+    }
+  }
+
+  // HR 数月 / 半年未活跃
+  if (f.excludeStaleHr && isStaleHr(job)) {
+    result.keep = false;
+    result.reasons.push(`HR ${job.hrActiveText}`);
   }
 
   // 排除关键词（命中即弃）
