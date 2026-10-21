@@ -5,7 +5,7 @@
   // 内存态后端
   const state = {
     settings: {
-      mode: 'auto', autoCapture: true, autoScore: false, showBadge: true, dedupe: true, maxJobs: 800,
+      mode: 'auto', autoCapture: true, autoScore: true, showBadge: true, dedupe: true, maxJobs: 800,
       activeProviderId: 'demo',
       privacy: { redactPII: true, sendCompanyName: true, confirmBeforeSend: false },
       filters: { enabled: false, keywordsInclude: [], keywordsExclude: [], riskKeywords: ['外包','驻场','猎头'], cities: [], salaryMinK: null, salaryMaxK: null, experience: [], degrees: [], excludeCompanies: [] },
@@ -23,7 +23,7 @@
       updatedAt: new Date().toISOString(), createdAt: new Date().toISOString(),
     },
     jobs: [
-      { uid:'boss:demo1', platform:'boss', jobId:'demo1', title:'高级前端工程师', salaryText:'25-40K·14薪', salaryMinK:25, salaryMaxK:40, city:'广州', district:'天河区·珠江新城', experience:'3-5年', degree:'本科', skills:['React','TypeScript','Node.js'], tags:['五险一金','弹性工作'], welfare:['补充医疗','年度体检'], company:'某互联网大厂', companyIndustry:'互联网', companyScale:'10000人以上', companyType:'', companyStage:'已上市', hrName:'', hrTitle:'技术经理', description:'', url:'https://www.zhipin.com/job_detail/demo1.html', publishedAt:'', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:true,
+      { uid:'boss:demo1', platform:'boss', jobId:'demo1', title:'高级前端工程师', salaryText:'25-40K·14薪', salaryMinK:25, salaryMaxK:40, city:'广州', district:'天河区·珠江新城', experience:'3-5年', degree:'本科', skills:['React','TypeScript','Node.js'], tags:['五险一金','弹性工作'], welfare:['补充医疗','年度体检'], company:'某互联网大厂', companyIndustry:'互联网', companyScale:'10000人以上', companyType:'', companyStage:'已上市', hrName:'', hrTitle:'技术经理', hrActiveText:'刚刚活跃', hrActiveAt:new Date(Date.now()-20*60000).toISOString(), description:'', url:'https://www.zhipin.com/job_detail/demo1.html', publishedAt:'', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:true,
         match:{ score:88, verdict:'strong', reasons:['React/TS 技能高度契合','有中后台与组件库经验','城市与薪资匹配'], gaps:['缺少大规模 SSR 经验'], risks:[], summary:'技能与经历高度匹配，建议优先沟通。',
           greetings:{
             short:'您好，4年前端，精通 React/TS，做过组件库建设，对这个高级前端岗位很感兴趣。',
@@ -32,7 +32,13 @@
           },
           greeting:'您好，我有4年前端经验，精通 React 与 TypeScript，曾主导公司组件库建设并将首屏性能优化40%，对贵司这个高级前端岗位很感兴趣，期待进一步交流。', at:new Date().toISOString() } },
       { uid:'qcwy:demo2', platform:'qcwy', jobId:'demo2', title:'Web前端开发工程师', salaryText:'1.5-2.5万·13薪', salaryMinK:15, salaryMaxK:25, city:'广州', district:'海珠区', experience:'1-3年', degree:'本科', skills:['Vue','JavaScript','CSS'], tags:['双休','带薪年假'], welfare:['五险一金'], company:'某科技有限公司', companyIndustry:'计算机软件', companyScale:'150-500人', companyType:'民营', companyStage:'', hrName:'', hrTitle:'HR', description:'岗位职责：负责公司前端产品开发……', url:'https://jobs.51job.com/demo2.html', publishedAt:'2026-09-18', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:false, match:null },
-      { uid:'boss:demo3', platform:'boss', jobId:'demo3', title:'前端外包驻场', salaryText:'12-18K', salaryMinK:12, salaryMaxK:18, city:'深圳', district:'南山区', experience:'3-5年', degree:'大专', skills:['jQuery','HTML'], tags:['外包'], welfare:[], company:'XX外包服务公司', companyIndustry:'人力资源', companyScale:'500-999人', companyType:'', companyStage:'', hrName:'', hrTitle:'招聘', description:'', url:'', publishedAt:'', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:false, match:{ score:38, verdict:'weak', reasons:['基础技能匹配'], gaps:['技术栈偏旧'], risks:['疑似外包驻场'], summary:'匹配度偏低，注意外包性质。', greeting:'', at:new Date().toISOString() } },
+      { uid:'boss:demo3', platform:'boss', jobId:'demo3', title:'前端外包驻场', salaryText:'12-18K', salaryMinK:12, salaryMaxK:18, city:'深圳', district:'南山区', experience:'3-5年', degree:'大专', skills:['jQuery','HTML'], tags:['外包'], welfare:[], company:'XX外包服务公司', companyIndustry:'人力资源', companyScale:'500-999人', companyType:'', companyStage:'', hrName:'', hrTitle:'招聘', hrActiveText:'半年前活跃', hrActiveAt:new Date(Date.now()-3*3600000).toISOString(), description:'', url:'', publishedAt:'', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:false, match:{ score:38, verdict:'weak', reasons:['基础技能匹配'], gaps:['技术栈偏旧'], risks:['疑似外包驻场'], summary:'匹配度偏低，注意外包性质。', greeting:'', at:new Date().toISOString() } },
+      { uid:'boss:demo4', platform:'boss', jobId:'demo4', title:'前端开发工程师（中后台）', salaryText:'20-30K·13薪', salaryMinK:20, salaryMaxK:30, city:'广州', district:'番禺区·万博', experience:'3-5年', degree:'本科', skills:['Vue','TypeScript','微前端'], tags:['双休'], welfare:['五险一金','餐补'], company:'某企业服务公司', companyIndustry:'企业服务', companyScale:'500-999人', companyType:'', companyStage:'B轮', hrName:'', hrTitle:'HRBP', hrActiveText:'本月活跃', hrActiveAt:new Date(Date.now()-90*60000).toISOString(), address:'广州番禺区万博中心', experienceJd:'5年以上', description:'岗位职责：负责中后台系统前端开发……任职要求：5年以上前端经验，熟悉 Vue 与微前端……', url:'https://www.zhipin.com/job_detail/demo4.html', publishedAt:'', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:false,
+        match:{ score:66, rawScore:72, activityPenalty:6, verdict:'good', eligible:true, blockers:[], dims:{skill:80,experience:62,requirement:70,location:85}, reasons:['Vue/TS 技能匹配','中后台经验契合'], gaps:['JD 正文要求 5 年以上，当前 4 年'], risks:[], summary:'整体匹配，经验年限略差；HR 本月活跃，已按活跃度扣分。', greeting:'', at:new Date().toISOString() } },
+      { uid:'boss:demo5', platform:'boss', jobId:'demo5', title:'React 前端工程师', salaryText:'22-35K', salaryMinK:22, salaryMaxK:35, city:'广州', district:'天河区·科韵路', experience:'3-5年', degree:'本科', skills:['React','Next.js'], tags:[], welfare:[], company:'某 SaaS 公司', companyIndustry:'互联网', companyScale:'100-499人', companyType:'', companyStage:'A轮', hrName:'', hrTitle:'招聘者', hrActiveText:'3日内活跃', hrActiveAt:new Date(Date.now()-40*60000).toISOString(), description:'', url:'https://www.zhipin.com/job_detail/demo5.html', publishedAt:'', raw:{}, savedAt:new Date().toISOString(), lastSeenAt:new Date().toISOString(), star:false, match:null },
+    ],
+    blocked: [
+      { uid:'boss:b1', platform:'boss', title:'前端驻场（银行项目）', company:'XX人力外包', at:new Date().toISOString() },
     ],
     // 模拟「当前查看的岗位」上下文（可用 __mockSwitchJob 切换来验证实时跟随）
     ctx: { platform:'boss', url:'https://www.zhipin.com/job_detail/demo1.html', jobKey:'demo1', isChat:false },
@@ -59,8 +65,9 @@
       case 'BLOCKED_GET': return state.blocked||[];
       case 'BLOCKED_CLEAR': state.blocked=[]; return [];
       case 'CONTACTS_MARK': { const ids=new Set(msg.uids||[msg.uid]); state.jobs=state.jobs.map(j=>ids.has(j.uid)?{...j,contacted:'job'}:j); setTimeout(()=>broadcast({ type:'JOBS_UPDATED' }),0); return { jobs: state.jobs, added: ids.size }; }
+      case 'AUTO_STATUS_GET': return { running:true, pending:5, done:12, lastError:'', lastErrorAt:0 };
       case 'CONTACTS_REMOVE':
-      case 'CONTACTS_GET': case 'CONTACTS_SYNC': case 'CONTACTS_CLEAR': case 'WORKER_HALT_CLEAR': return { contacts: [{ company:'示例科技', title:'前端', jobId:'' }], companies: 1, syncedAt: Date.now(), halt: null };
+      case 'CONTACTS_GET': case 'CONTACTS_SYNC': case 'CONTACTS_CLEAR': case 'WORKER_HALT_CLEAR': return { contacts: [{ company:'示例科技', title:'前端', jobId:'', source:'chat' }, { company:'某云计算公司', title:'Web 前端', jobId:'', source:'greeting' }, { company:'某游戏公司', title:'H5 开发', jobId:'', source:'manual' }], companies: 3, syncedAt: Date.now(), halt: null };
       case 'JOB_EXPORT_REQUEST': return { format: msg.format||'json', content: JSON.stringify(state.jobs,null,2), count: state.jobs.length };
       case 'GREETING_SAVE': state.jobs = state.jobs.map(j=>j.uid===msg.uid?{...j,greetingDraft:msg.text}:j); return state.jobs;
       case 'ACTIVE_CONTEXT_REQUEST': return { platform:state.ctx.platform, url:state.ctx.url, jobKey:state.ctx.jobKey, isChat:state.ctx.isChat, platformName: state.ctx.platform==='boss'?'BOSS 直聘':'前程无忧 51job' };
@@ -98,17 +105,22 @@
     }
   }
 
+  // 用真实的 mergeSettings 补齐默认设置（节奏预设、并发等新字段），避免预览缺字段
+  const ready = import('../src/common/settingsStore.js')
+    .then((m) => { state.settings = m.mergeSettings(state.settings); })
+    .catch((e) => console.warn('[mock] mergeSettings 加载失败', e));
+
   window.chrome = {
     runtime: {
       lastError: null,
       id: 'dev-mock',
-      sendMessage: (msg, cb) => {
+      sendMessage: (msg, cb) => ready.then(() => {
         let env;
         try { env = { ok:true, data: respond(msg) }; }
         catch (e) { env = { ok:false, error: e instanceof Error ? e.message : String(e) }; }
         if (typeof cb === 'function') setTimeout(()=>cb(env), 30);
-        return Promise.resolve(env);
-      },
+        return env;
+      }),
       onMessage: { addListener: (fn)=>listeners.push(fn), removeListener: ()=>{} },
       openOptionsPage: () => console.log('[mock] openOptionsPage'),
       getURL: (p) => '/' + p,
