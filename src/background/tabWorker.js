@@ -13,6 +13,7 @@ const HALT_KEY = 'jobHelperWorkerHaltV1'; // { until, reason }
 const DAILY_KEY = 'jobHelperWorkerDailyV1'; // { day, count }
 const HOURLY_KEY = 'jobHelperWorkerHourlyV1'; // 最近一小时打开的时间戳
 const OPEN_KEY = 'jobHelperWorkerTabsV1'; // storage.session：仍开着的后台标签页 id
+const CAP_BYPASS_KEY = 'jobHelperWorkerCapBypassV1'; // storage.session：{ until }，用户手动「立即继续」后本轮不受时段 / 额度限制
 const IDLE_THRESHOLD_SEC = 180; // 超过 3 分钟无键鼠操作视为离开
 const IDLE_WAIT_MAX_MS = 15 * 60 * 1000; // 离开时最多等 15 分钟，仍未回来就放弃本轮
 
@@ -102,6 +103,26 @@ export async function clearHalt() {
   await chrome.storage.local.remove(HALT_KEY);
 }
 
+// 用户手动「立即继续」：本轮队列补完前（最多到今天结束）不再按活跃时段 / 每小时 / 每天额度挂起，
+// 否则额度没变、一继续马上又被同一个原因暂停。打开间隔、熔断照旧。
+export async function setCapBypass(on) {
+  try {
+    if (!on) return await chrome.storage.session.remove(CAP_BYPASS_KEY);
+    const end = new Date();
+    end.setHours(24, 0, 0, 0);
+    await chrome.storage.session.set({ [CAP_BYPASS_KEY]: { until: end.getTime() } });
+  } catch {}
+}
+
+async function capBypassed() {
+  try {
+    const b = (await chrome.storage.session.get(CAP_BYPASS_KEY))[CAP_BYPASS_KEY];
+    return !!b && b.until > Date.now();
+  } catch {
+    return false;
+  }
+}
+
 // 每天额度：用完返回原因（当天不再继续）；打开成功才计数
 async function dailyExceeded(p) {
   const day = new Date().toISOString().slice(0, 10);
@@ -143,12 +164,14 @@ async function userActive() {
 // 运行前的人工节奏检查：返回 { reason, retryMs? }，reason 非空表示本轮放弃，retryMs 是建议多久后再试。
 // urgent：用户刚点了「AI 分析」等，人就在跟前——不休息、只用较短的间隔。
 async function paceBeforeOpen(p, urgent) {
-  if (!inActiveHours(p.activeHours)) return { reason: `不在设定的活跃时段（${p.activeHours}）` };
-  const daily = await dailyExceeded(p);
-  if (daily) return { reason: daily };
-  // 本小时额度满了：不在这里干等（界面看不到原因，像卡死），交给调用方挂起，到最早那次滑出一小时窗口时再继续
-  const hourWait = await hourlyWaitMs(p);
-  if (hourWait > 0) return { reason: `近一小时后台补全已达 ${p.hourlyCap} 次上限`, retryMs: hourWait };
+  if (!(await capBypassed())) {
+    if (!inActiveHours(p.activeHours)) return { reason: `不在设定的活跃时段（${p.activeHours}）` };
+    const daily = await dailyExceeded(p);
+    if (daily) return { reason: daily };
+    // 本小时额度满了：不在这里干等（界面看不到原因，像卡死），交给调用方挂起，到最早那次滑出一小时窗口时再继续
+    const hourWait = await hourlyWaitMs(p);
+    if (hourWait > 0) return { reason: `近一小时后台补全已达 ${p.hourlyCap} 次上限`, retryMs: hourWait };
+  }
   if (urgent) {
     const gap = Math.max(1500, sampleSkewed(p.gapMinSec, Math.min(p.gapMaxSec, p.gapMinSec * 2)) * 1000 / Math.max(1, p.detailConcurrency));
     const wait = lastRunAt + gap - Date.now();

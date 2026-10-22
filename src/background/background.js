@@ -10,7 +10,7 @@ import {
   markJobsContacted, removeContacts,
 } from '../common/jobsStore.js';
 import { insertDetailTask, taskTier } from '../common/pacing.js';
-import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt } from './tabWorker.js';
+import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt, setCapBypass } from './tabWorker.js';
 import {
   loadSettings, saveSettings, loadProviders, saveProviders, getActiveProvider,
 } from '../common/settingsStore.js';
@@ -100,6 +100,8 @@ async function handle(msg, sender) {
     case MSG.AUTO_STATUS_GET:
       return autoStatus;
     case MSG.WORKER_HALT_CLEAR:
+      // 用户手动继续：除了解除熔断，本轮也不再被额度 / 时段挂起
+      await setCapBypass(true);
       await clearHalt();
       await resumeDetails();
       return contactsOverview();
@@ -535,6 +537,7 @@ async function runDetailQueue() {
   } finally {
     detailRunning = false;
     wakeDetail = null;
+    if (!detailQueue.length) setCapBypass(false); // 手动继续的这一轮补完了，恢复正常额度
     pushProgress();
   }
 }
