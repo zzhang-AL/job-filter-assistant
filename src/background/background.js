@@ -4,7 +4,7 @@ import {
   normalizeResponse, platformOfHost, matchPlatformApi, extractBossContacts, buildContactIndex, contactStatus,
 } from '../common/platforms.js';
 import {
-  loadJobs, mergeJobs, patchJob, pickJobsNeedingDetail, bossDetailPageUrl, isDetailReady, deleteJob, clearJobs, toggleStar, setJobMatch, setJobGreeting,
+  loadJobs, mergeJobs, patchJob, markJobs, pickJobsNeedingDetail, bossDetailPageUrl, isDetailReady, deleteJob, clearJobs, toggleStar, setJobMatch, setJobGreeting,
   getMatchCache, putMatchCache, clearMatchCache,
   loadBlocked, blockJobs, unblockJob, clearBlocked, loadContacts, addContacts, clearContacts,
   markJobsContacted, removeContacts,
@@ -60,6 +60,8 @@ async function handle(msg, sender) {
       return exportJobs(msg.format);
     case MSG.GREETING_SAVE:
       return afterJobsChange(await setJobGreeting(msg.uid, msg.text));
+    case MSG.JOB_MARK:
+      return afterJobsChange(await markJobs(Array.isArray(msg.uids) ? msg.uids : [msg.uid], { viewed: msg.viewed, dismissed: msg.dismissed }));
 
     // ---------- 屏蔽 ----------
     case MSG.JOB_BLOCK: {
@@ -98,7 +100,7 @@ async function handle(msg, sender) {
     case MSG.CONTACTS_SYNC:
       return syncContacts({ force: true, windowId: msg.windowId });
     case MSG.AUTO_STATUS_GET:
-      return autoStatus;
+      return fullAutoStatus();
     case MSG.WORKER_HALT_CLEAR:
       // 用户手动继续：除了解除熔断，本轮也不再被额度 / 时段挂起
       await setCapBypass(true);
@@ -138,6 +140,7 @@ async function handle(msg, sender) {
         });
         // 实时推给面板：让「当前岗位」跟随网站上点开的岗位切换
         broadcast(MSG.CURRENT_JOB, { tabId: sender.tab.id, platform: msg.platform, jobKey: msg.jobKey });
+        markViewedOnPage(msg.platform, msg.jobKey).catch(() => {});
       }
       return { ok: true };
     case MSG.ACTIVE_CONTEXT_REQUEST:
@@ -194,7 +197,7 @@ async function handle(msg, sender) {
 
     // ---------- 面板控制 ----------
     case MSG.OPEN_OPTIONS:
-      chrome.runtime.openOptionsPage();
+      await openOptions(msg.section);
       return { ok: true };
 
     default:
@@ -698,7 +701,20 @@ let autoStatus = { running: false, pending: 0, done: 0, lastError: '', lastError
 
 function setAutoStatus(patch) {
   autoStatus = { ...autoStatus, ...patch };
-  broadcast(MSG.AUTO_STATUS, { status: autoStatus });
+  broadcast(MSG.AUTO_STATUS, { status: fullAutoStatus() });
+}
+
+// 给侧边栏的状态：自动分析进度 + 后台补详情（是否挂起、原因、何时自动继续），挂起提示不只在批量分析时显示
+function fullAutoStatus() {
+  return { ...autoStatus, detail: { running: detailRunning, pending: detailQueue.length, halted: detailHalted, resumeAt: detailResumeAt } };
+}
+
+// 在网站上打开了某个已收录岗位 = 看过。只记第一次，避免每次切换都写库
+async function markViewedOnPage(platform, jobKey) {
+  if (!platform || !jobKey) return;
+  const uid = `${platform}:${jobKey}`;
+  const job = (await loadJobs()).find((j) => j.uid === uid);
+  if (job && !job.viewedAt) afterJobsChange(await markJobs([uid], { viewed: true }));
 }
 
 function autoCandidates(jobs, settings) {
@@ -707,6 +723,7 @@ function autoCandidates(jobs, settings) {
       isDetailReady(j) &&
       !j.match &&
       !j.contacted &&
+      !j.dismissedAt && // 标了不感兴趣的不花 AI 调用；恢复后会重新进入候选
       (j.autoScoreFails || 0) < AUTO_MAX_FAILS &&
       !inActiveBatch(j.uid) && // 正在批量分析里的交给批量，避免同一岗位分析两次
       !scoringInFlight.has(j.uid) &&
@@ -845,6 +862,7 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 chrome.tabs.onRemoved.addListener((tabId) => loginPageTabs.delete(tabId));
 
 function pushProgress() {
+  broadcast(MSG.AUTO_STATUS, { status: fullAutoStatus() });
   if (!progressTab || progressTab.id == null) return;
   chrome.tabs
     .sendMessage(progressTab.id, { type: MSG.DETAIL_PROGRESS, done: detailDone, pending: detailQueue.length, halted: detailHalted, resumeAt: detailResumeAt })
@@ -903,6 +921,20 @@ async function recordGreeted(uid) {
   if (!job) return;
   const { jobs } = await addContacts([{ jobId: job.jobId, title: job.title, company: job.company, hrName: job.hrName }], 'greeting');
   if (jobs) afterJobsChange(jobs);
+}
+
+// 打开设置页并定位到某一节（#ai / #profile …）；已开着就切过去，不重复开
+async function openOptions(section) {
+  if (!section) return chrome.runtime.openOptionsPage();
+  const base = chrome.runtime.getURL('options.html');
+  const url = `${base}#${section}`;
+  const tab = (await chrome.tabs.query({})).find((t) => (t.url || '').startsWith(base));
+  if (tab) {
+    await chrome.tabs.update(tab.id, { url, active: true });
+    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  } else {
+    await chrome.tabs.create({ url });
+  }
 }
 
 function afterJobsChange(list) {

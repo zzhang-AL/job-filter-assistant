@@ -327,6 +327,16 @@ section('个人画像');
 test('空画像评分为 0', () => {
   assert.equal(scoreProfile(emptyProfile()).score, 0);
 });
+test('全部填齐评分为 100', () => {
+  const p = emptyProfile();
+  p.target.jobTitles = ['前端']; p.target.cities = ['广州']; p.target.salaryMinK = 15;
+  p.basics.yearsOfExperience = 3; p.basics.education = '本科'; p.basics.currentTitle = '前端';
+  p.capabilities.skills = ['React']; p.capabilities.strengths = ['性能']; p.capabilities.industryExperience = ['电商'];
+  p.workSummary = '经历'; p.projectSummary = '项目';
+  const s = scoreProfile(p);
+  assert.equal(s.score, 100);
+  assert.equal(s.missing.length, 0);
+});
 test('填充后评分上升', () => {
   const p = emptyProfile();
   p.target.jobTitles = ['前端工程师'];

@@ -56,6 +56,7 @@ export const MSG = {
   JOB_STAR_TOGGLE: 'JOB_STAR_TOGGLE',
   JOB_EXPORT_REQUEST: 'JOB_EXPORT_REQUEST',
   GREETING_SAVE: 'GREETING_SAVE', // UI -> bg：保存用户编辑后的招呼语
+  JOB_MARK: 'JOB_MARK', // UI -> bg：标记看过 / 不感兴趣（{ uids, viewed?, dismissed? }，true 设、false 清）
   JOB_BLOCK: 'JOB_BLOCK', // UI -> bg：屏蔽岗位（移出岗位库，后续不再收录）
   JOB_UNBLOCK: 'JOB_UNBLOCK',
   BLOCKED_GET: 'BLOCKED_GET',

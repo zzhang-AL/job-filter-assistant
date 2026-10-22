@@ -44,7 +44,7 @@ export function emptyProfile() {
   };
 }
 
-// 完整度评分项（权重合计 100）
+// 完整度评分项（按权重折算成百分比，全部填齐 = 100）
 const SCORE_ITEMS = [
   { label: '目标岗位', weight: 14, ok: (p) => p.target.jobTitles.length > 0 },
   { label: '目标城市', weight: 8, ok: (p) => p.target.cities.length > 0 },
@@ -59,11 +59,13 @@ const SCORE_ITEMS = [
   { label: '项目/成就', weight: 6, ok: (p) => !!p.projectSummary.trim() || p.highlights.length > 0 },
 ];
 
+const TOTAL_WEIGHT = SCORE_ITEMS.reduce((s, it) => s + it.weight, 0);
+
 export function scoreProfile(profile) {
   const p = sanitizeProfile(profile);
   const done = SCORE_ITEMS.filter((it) => it.ok(p));
   return {
-    score: done.reduce((s, it) => s + it.weight, 0),
+    score: Math.round((done.reduce((s, it) => s + it.weight, 0) * 100) / TOTAL_WEIGHT),
     completed: done.length,
     total: SCORE_ITEMS.length,
     missing: SCORE_ITEMS.filter((it) => !it.ok(p)).map((it) => it.label),

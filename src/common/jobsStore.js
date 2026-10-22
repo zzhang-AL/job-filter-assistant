@@ -170,6 +170,17 @@ async function patchJobUnlocked(uid, patch) {
   return next;
 }
 
+// 看过 / 不感兴趣：只是浏览状态，不像屏蔽那样移出岗位库。true 记下时间、false 清除，undefined 不动
+async function markJobsUnlocked(uids, { viewed, dismissed } = {}) {
+  const ids = new Set(uids);
+  const now = new Date().toISOString();
+  const pick = (flag, prev) => (flag === undefined ? prev : flag ? prev || now : undefined);
+  const list = await loadJobs();
+  const next = list.map((j) => (ids.has(j.uid) ? { ...j, viewedAt: pick(viewed, j.viewedAt), dismissedAt: pick(dismissed, j.dismissedAt) } : j));
+  await saveJobs(next);
+  return next;
+}
+
 // 保存用户编辑后的招呼语草稿（发送前的最终文案，独立于 AI 生成的 match.greetings）
 async function setJobGreetingUnlocked(uid, text) {
   const list = await loadJobs();
@@ -304,6 +315,7 @@ export const toggleStar = locked(toggleStarUnlocked);
 export const setJobMatch = locked(setJobMatchUnlocked);
 export const setJobGreeting = locked(setJobGreetingUnlocked);
 export const patchJob = locked(patchJobUnlocked);
+export const markJobs = locked(markJobsUnlocked);
 export const blockJobs = locked(blockJobsUnlocked);
 export const unblockJob = locked(unblockJobUnlocked);
 export const clearBlocked = locked(clearBlockedUnlocked);
