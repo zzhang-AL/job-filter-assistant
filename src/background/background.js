@@ -18,9 +18,10 @@ import { loadProfile, saveProfile, clearProfile, sanitizeProfile } from '../comm
 import { sanitizeProvider } from '../common/ai/providers.js';
 import { chat, chatJson, testProvider, listModels } from '../common/ai/client.js';
 import {
-  buildResumeExtractPrompt, buildMatchPrompt, sanitizeMatch, buildTailorResumePrompt, sanitizeTailor, scoreToVerdict,
+  buildResumeExtractPrompt, buildMatchPrompt, buildGreetingPrompt, sanitizeMatch, buildTailorResumePrompt, sanitizeTailor, scoreToVerdict,
+  normalizeGreetings, promptText, PROMPT_VERSION,
 } from '../common/ai/prompts.js';
-import { activityPenalty, activitySortKey } from '../common/activity.js';
+import { activityPenalty, activitySortKey, hrActivityTier } from '../common/activity.js';
 import { evaluateJob } from '../common/filters.js';
 import { redactText } from '../common/ai/privacy.js';
 
@@ -194,6 +195,12 @@ async function handle(msg, sender) {
       return cancelBatch();
     case MSG.AI_TAILOR_RESUME:
       return tailorResume(msg.uid, msg.job);
+    case MSG.AI_GREETING:
+      return generateGreetings(msg.uid, { force: !!msg.force });
+    case MSG.AI_USAGE_GET:
+      return getUsage();
+    case MSG.AI_USAGE_RESET:
+      return resetUsage();
 
     // ---------- 面板控制 ----------
     case MSG.OPEN_OPTIONS:
@@ -1133,8 +1140,92 @@ async function extractResume(text) {
   const clean = settings.privacy.redactPII ? redactText(String(text || '')) : String(text || '');
   if (!clean.trim()) throw new Error('简历内容为空');
   // 不写死 maxTokens：交由供应商设置（设置页的 max tokens）决定，否则该配置项形同虚设
-  const draft = await chatJson(provider, buildResumeExtractPrompt(clean), { json: true });
+  const draft = await callAi(provider, buildResumeExtractPrompt(clean));
   return sanitizeProfile(draft); // 返回草稿，由前端展示给用户确认后再入库
+}
+
+// ============ AI 调用：本地缓存 + 供应商前缀缓存 + 用量统计 ============
+// 本地缓存键 = 岗位 uid + 「实际发给 AI 的全部内容 + 模型 + 提示词版本」的哈希：
+//  - 只要发出去的字节一样（画像、岗位、隐私设置都没变），就直接复用上次的结果，不再请求；
+//  - 改名字（不发给 AI）、HR 活跃度变化（不发给 AI，由程序扣分）都不会让缓存失效；
+//  - 换了 uid 但内容完全相同的岗位（同一岗位重新发布、换了链接）也能复用。
+function aiCacheKey(uid, provider, prompt, kind = 'm') {
+  return `${uid}::${kind}${hashStr(`${PROMPT_VERSION}|${provider.protocol}|${provider.model}|${promptText(prompt)}`)}`;
+}
+
+async function lookupAiCache(key) {
+  const cache = await getMatchCache();
+  if (cache[key]) return cache[key];
+  const suffix = key.slice(key.indexOf('::'));
+  const other = Object.keys(cache).find((k) => k.endsWith(suffix));
+  return other ? cache[other] : null;
+}
+
+// 前缀预热：供应商缓存要等第一个请求返回后才能被读到。同一前缀（system + 画像）近几分钟没用过时，
+// 先只放一个请求出去，其余等它回来再发，这样后面的请求都能命中缓存，而不是并发地各付一次全价。
+const WARM_MS = 4 * 60 * 1000;
+const prefixWarm = new Map(); // 前缀哈希 -> { at: 上次成功时间, pending: Promise | null }
+async function withWarmPrefix(prompt, fn) {
+  const sys = prompt.find((m) => m.role === 'system');
+  const user = prompt.find((m) => m.role === 'user');
+  const head = Array.isArray(user && user.content) ? user.content.filter((c) => c.cache).map((c) => c.text).join('\n') : '';
+  const key = hashStr(`${sys ? sys.content : ''}|${head}`);
+  for (;;) {
+    const w = prefixWarm.get(key);
+    if (w && Date.now() - w.at < WARM_MS) break; // 已经是热的
+    if (w && w.pending) {
+      await w.pending.catch(() => {});
+      continue;
+    }
+    // 冷的：由这个请求负责预热
+    const pending = fn();
+    prefixWarm.set(key, { at: w ? w.at : 0, pending });
+    try {
+      const r = await pending;
+      prefixWarm.set(key, { at: Date.now(), pending: null });
+      return r;
+    } catch (e) {
+      prefixWarm.set(key, { at: w ? w.at : 0, pending: null });
+      throw e;
+    }
+  }
+  const r = await fn();
+  prefixWarm.set(key, { at: Date.now(), pending: null });
+  return r;
+}
+
+// 所有 AI 请求都走这里：并发闸门 + 用量统计
+async function callAi(provider, prompt, { warm = false } = {}) {
+  const run = () => withAiSlot(() => chatJson(provider, prompt, { json: true, onUsage: recordUsage }));
+  return warm ? withWarmPrefix(prompt, run) : run();
+}
+
+// —— 用量统计：调用次数、输入 / 命中缓存 / 输出 token、本地缓存命中（直接省掉的请求） ——
+const USAGE_KEY = 'jobHelperAiUsageV1';
+let usageChain = Promise.resolve();
+function bumpUsage(patch) {
+  usageChain = usageChain
+    .then(async () => {
+      const got = (await chrome.storage.local.get(USAGE_KEY))[USAGE_KEY];
+      const u = got && typeof got === 'object' ? got : { since: Date.now(), calls: 0, input: 0, cached: 0, output: 0, localHits: 0 };
+      for (const [k, v] of Object.entries(patch)) u[k] = (u[k] || 0) + v;
+      await chrome.storage.local.set({ [USAGE_KEY]: u });
+    })
+    .catch(() => {});
+  return usageChain;
+}
+function recordUsage(u) {
+  bumpUsage({ calls: 1, input: u.input, cached: u.cached, output: u.output });
+}
+async function getUsage() {
+  await usageChain;
+  const got = (await chrome.storage.local.get(USAGE_KEY))[USAGE_KEY];
+  return got && typeof got === 'object' ? got : { since: 0, calls: 0, input: 0, cached: 0, output: 0, localHits: 0 };
+}
+async function resetUsage() {
+  await usageChain;
+  await chrome.storage.local.remove(USAGE_KEY);
+  return getUsage();
 }
 
 // —— 匹配打分（单个） ——
@@ -1151,8 +1242,7 @@ function scoreOne(uid, jobArg, opts = {}) {
   return p;
 }
 
-// requireDetail：批量 / 自动匹配要求详情必须就绪，未就绪直接报错跳过，绝不拿列表摘要凑合分析
-async function scoreOneNow(uid, jobArg, { force = false, requireDetail = false } = {}) {
+async function loadAiContext(uid, jobArg, { requireDetail = false } = {}) {
   const provider = await getActiveProvider();
   if (!provider) throw new Error('尚未配置 AI 供应商，请先到设置页添加');
   const [profile, settings] = await Promise.all([loadProfile(), loadSettings()]);
@@ -1166,47 +1256,86 @@ async function scoreOneNow(uid, jobArg, { force = false, requireDetail = false }
     job = (await findStored()) || job;
   }
   if (requireDetail && !isDetailReady(job)) throw new Error('岗位详情（JD / HR 活跃）未就绪，已跳过');
+  return { provider, profile, job, aiOpts: { includeCompany: settings.privacy.sendCompanyName } };
+}
 
-  const fp = profileFingerprint(profile, provider);
-  const cache = await getMatchCache();
-  // 岗位内容（JD / HR 活跃）变化后缓存失效，避免沿用没有 JD 时的分析
-  const cacheKey = `${job.uid}::${fp}::${hashStr(`${job.description || ''}|${job.hrActiveText || ''}`)}`;
-  if (!force && cache[cacheKey]) {
-    await setJobMatch(job.uid, cache[cacheKey]);
-    return cache[cacheKey];
+// requireDetail：批量 / 自动匹配要求详情必须就绪，未就绪直接报错跳过，绝不拿列表摘要凑合分析
+async function scoreOneNow(uid, jobArg, { force = false, requireDetail = false } = {}) {
+  const { provider, profile, job, aiOpts } = await loadAiContext(uid, jobArg, { requireDetail });
+  const prompt = buildMatchPrompt(profile, job, aiOpts);
+  const key = aiCacheKey(job.uid, provider, prompt);
+
+  let base = force ? null : await lookupAiCache(key);
+  if (base) bumpUsage({ localHits: 1 });
+  else {
+    // 不写死 maxTokens：推理模型会先用 reasoning_content 吃掉预算，硬编码 1024 会导致正文 JSON 被截断
+    base = sanitizeMatch(await callAi(provider, prompt, { warm: true }));
+    await putMatchCache(key, base); // 缓存的是 AI 原始结论；活跃度扣分每次按当前活跃度现算
   }
-
-  const prompt = buildMatchPrompt(profile, job, {
-    includeCompany: settings.privacy.sendCompanyName,
-  });
-  // 不写死 maxTokens：推理模型会先用 reasoning_content 吃掉预算，硬编码 1024 会导致正文 JSON 被截断
-  const raw = await withAiSlot(() => chatJson(provider, prompt, { json: true }));
-  const match = applyActivityPenalty(sanitizeMatch(raw), job);
-  await putMatchCache(cacheKey, match);
+  const match = finalizeMatch(base, job);
   await setJobMatch(job.uid, match);
   if (job.autoScoreFails) await patchJob(job.uid, { autoScoreFails: 0, autoScoreError: '' });
   broadcast(MSG.JOBS_UPDATED, { uid: job.uid, scored: true });
   return match;
 }
 
+// AI 结论 + 程序统一处理的部分：HR 活跃度扣分、停招提示；重新分析时保留已经生成过的招呼语
+function finalizeMatch(base, job) {
+  const prev = job.match;
+  const risks = [...(base.risks || [])];
+  const tier = hrActivityTier(job);
+  if (tier === 4 && !risks.some((r) => /未活跃|停招/.test(r))) risks.push('HR 长期未活跃，岗位可能已停招');
+  else if (tier === 3 && !risks.some((r) => /活跃/.test(r))) risks.push('HR 本月才活跃过，回复可能较慢');
+  let m = { ...base, risks };
+  if (!hasGreetings(m) && prev && hasGreetings(prev)) m = { ...m, greetings: prev.greetings, greeting: prev.greeting };
+  return applyActivityPenalty(m, job);
+}
+
+function hasGreetings(m) {
+  const g = normalizeGreetings(m || {});
+  return !!(g.short || g.standard || g.detailed);
+}
+
+// —— 招呼语（按需生成）：与匹配分析共用 system + 画像前缀，命中供应商缓存时只付岗位部分的输入 ——
+const greetingInFlight = new Map();
+function generateGreetings(uid, opts = {}) {
+  const running = greetingInFlight.get(uid);
+  if (running && !opts.force) return running;
+  const p = generateGreetingsNow(uid, opts).finally(() => {
+    if (greetingInFlight.get(uid) === p) greetingInFlight.delete(uid);
+  });
+  greetingInFlight.set(uid, p);
+  return p;
+}
+
+async function generateGreetingsNow(uid, { force = false } = {}) {
+  const { provider, profile, job, aiOpts } = await loadAiContext(uid, null);
+  if (!job.match) throw new Error('请先完成匹配分析');
+  const prompt = buildGreetingPrompt(profile, job, job.match, aiOpts);
+  const key = aiCacheKey(job.uid, provider, prompt, 'g');
+  let hit = force ? null : await lookupAiCache(key);
+  if (hit) bumpUsage({ localHits: 1 });
+  else {
+    hit = { greetings: normalizeGreetings(await callAi(provider, prompt, { warm: true })), at: new Date().toISOString() };
+    await putMatchCache(key, hit);
+  }
+  const greetings = normalizeGreetings(hit);
+  if (!greetings.standard) throw new Error('AI 没有返回招呼语，请重试');
+  // 以写入时库里的匹配结果为准（生成期间可能被重新分析过）
+  const fresh = (await loadJobs()).find((j) => j.uid === job.uid);
+  const base = (fresh && fresh.match) || job.match;
+  await setJobMatch(job.uid, { ...base, greetings, greeting: greetings.standard });
+  broadcast(MSG.JOBS_UPDATED, { uid: job.uid });
+  return greetings;
+}
+
 // —— 简历定制建议（按岗位 JD，不落库） ——
 // 只返回建议给前端会话内展示，不写入岗位库/画像/缓存，符合「简历数据仅本会话使用」。
 async function tailorResume(uid, jobArg) {
-  const provider = await getActiveProvider();
-  if (!provider) throw new Error('尚未配置 AI 供应商，请先到设置页添加');
-  const [profile, settings, jobs] = await Promise.all([loadProfile(), loadSettings(), loadJobs()]);
-  let job = jobs.find((j) => j.uid === uid) || jobArg;
-  if (!job) throw new Error('岗位不存在');
-  if (!isDetailReady(job)) {
-    await ensureDetail(job);
-    job = (await loadJobs()).find((j) => j.uid === job.uid) || job;
-  }
-  const prompt = buildTailorResumePrompt(profile, job, {
-    includeCompany: settings.privacy.sendCompanyName,
-  });
+  const { provider, profile, job, aiOpts } = await loadAiContext(uid, jobArg);
+  const prompt = buildTailorResumePrompt(profile, job, aiOpts);
   // 不写死 maxTokens：交由供应商设置决定
-  const raw = await withAiSlot(() => chatJson(provider, prompt, { json: true }));
-  return sanitizeTailor(raw);
+  return sanitizeTailor(await callAi(provider, prompt, { warm: true }));
 }
 
 // 全局 AI 并发闸门：自动分析、批量、手动分析、简历建议加起来同时最多 aiConcurrency 个请求
@@ -1232,28 +1361,18 @@ function applyActivityPenalty(match, job) {
   return { ...match, rawScore: match.score, activityPenalty: penalty, score, verdict: scoreToVerdict(score) };
 }
 
-// 画像+供应商指纹：任一变化则缓存失效
-function profileFingerprint(profile, provider) {
-  const s = JSON.stringify({
-    t: profile.target,
-    c: profile.capabilities,
-    b: profile.basics,
-    w: profile.workSummary,
-    pj: profile.projectSummary,
-    h: profile.highlights,
-    pr: profile.preference,
-    m: provider.model,
-  });
-  return hashStr(s);
-}
-
-// 简单 hash
+// 53 位哈希（cyrb53）：缓存键用，碰撞概率远低于 32 位
 function hashStr(s) {
-  let h = 0;
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
   for (let i = 0; i < s.length; i++) {
-    h = (h * 31 + s.charCodeAt(i)) | 0;
+    const ch = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
   }
-  return String(h >>> 0);
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }
 
 async function exportJobs(format) {

@@ -110,6 +110,9 @@ export const MSG = {
   BATCH_STATUS: 'BATCH_STATUS', // UI -> bg：批量进度
   BATCH_CANCEL: 'BATCH_CANCEL', // UI -> bg：停止批量分析
   AI_TAILOR_RESUME: 'AI_TAILOR_RESUME', // 按岗位 JD 生成简历定制建议（不落库，会话内使用）
+  AI_GREETING: 'AI_GREETING', // 按需生成三档招呼语（匹配分析不再顺带生成，省输出 token）
+  AI_USAGE_GET: 'AI_USAGE_GET', // AI 用量与缓存命中统计
+  AI_USAGE_RESET: 'AI_USAGE_RESET',
 
   // 面板控制
   OPEN_OPTIONS: 'OPEN_OPTIONS',

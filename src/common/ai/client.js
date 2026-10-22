@@ -11,7 +11,9 @@ export class AiError extends Error {
 }
 
 // 统一入口：给定 provider + prompt，返回模型文本。
-// opts: { system, temperature, maxTokens, json(bool 期望 JSON), signal }
+// opts: { system, temperature, maxTokens, json(bool 期望 JSON), signal, onUsage(usage) }
+// 消息 content 可以是字符串，也可以是分段数组 [{ text, cache? }]：cache 标记「到这里为止的前缀可复用」——
+// Anthropic 在该段打 cache_control 断点，其他协议把各段拼成同样的文本（它们自动缓存相同前缀）。
 export async function chat(providerInput, prompt, opts = {}) {
   const p = sanitizeProvider(providerInput);
   const base = Array.isArray(prompt) ? prompt : [{ role: 'user', content: String(prompt) }];
@@ -21,6 +23,10 @@ export async function chat(providerInput, prompt, opts = {}) {
   const res = await doFetch(req.url, req.init, opts.signal);
   const data = await parseJsonSafe(res);
   if (!res.ok) throw new AiError(errMessage(p, data, res.status), res.status);
+  if (opts.onUsage) {
+    const u = extractUsage(p.protocol, data);
+    if (u) opts.onUsage(u);
+  }
   return extractText(p.protocol, data);
 }
 
@@ -76,8 +82,14 @@ function buildRequest(p, messages, opts) {
         },
         body: JSON.stringify({
           model: p.model,
-          system: system || undefined,
-          messages: chatMsgs.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+          // system 固定不变：单独打一个缓存断点，画像变了也还能命中 system 这一段
+          system: system ? [{ type: 'text', text: system, cache_control: EPHEMERAL }] : undefined,
+          messages: chatMsgs.map((m) => ({
+            role: m.role === 'assistant' ? 'assistant' : 'user',
+            content: Array.isArray(m.parts)
+              ? m.parts.map((part) => ({ type: 'text', text: part.text, ...(part.cache ? { cache_control: EPHEMERAL } : {}) }))
+              : m.content,
+          })),
           temperature,
           max_tokens: maxTokens,
         }),
@@ -123,6 +135,7 @@ function buildRequest(p, messages, opts) {
           temperature,
           max_output_tokens: maxTokens,
           text: wantJson ? { format: { type: 'json_object' } } : undefined,
+          prompt_cache_key: openAiCacheKey(p),
         }),
       },
     };
@@ -136,10 +149,11 @@ function buildRequest(p, messages, opts) {
       headers: authHeaders(p),
       body: JSON.stringify({
         model: p.model,
-        messages: system ? [{ role: 'system', content: system }, ...chatMsgs] : chatMsgs,
+        messages: [...(system ? [{ role: 'system', content: system }] : []), ...chatMsgs.map((m) => ({ role: m.role, content: m.content }))],
         temperature,
         max_tokens: maxTokens,
         response_format: wantJson ? { type: 'json_object' } : undefined,
+        prompt_cache_key: openAiCacheKey(p),
       }),
     },
   };
@@ -185,12 +199,32 @@ function joinUrl(base, path) {
   return `${String(base).replace(/\/+$/, '')}/${String(path).replace(/^\/+/, '')}`;
 }
 
+const EPHEMERAL = { type: 'ephemeral' };
+
+// OpenAI 官方：同一 key 的请求会尽量路由到同一台缓存机器，提高前缀缓存命中；其他兼容网关不认识这个字段，不发
+function openAiCacheKey(p) {
+  try {
+    return new URL(p.requestUrl || p.baseUrl).hostname === 'api.openai.com' ? 'job-filter-assistant' : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// 分段内容拼成文本：各段之间固定用空行连接，保证同样的分段得到同样的字节
+function partsText(content) {
+  return Array.isArray(content) ? content.map((c) => String(c && c.text != null ? c.text : '')).join('\n\n') : String(content);
+}
+
 function splitSystem(messages) {
   let system = '';
   const chatMsgs = [];
   for (const m of messages) {
-    if (m.role === 'system') system += (system ? '\n' : '') + m.content;
-    else chatMsgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content) });
+    if (m.role === 'system') system += (system ? '\n' : '') + partsText(m.content);
+    else {
+      const msg = { role: m.role === 'assistant' ? 'assistant' : 'user', content: partsText(m.content) };
+      if (Array.isArray(m.content)) msg.parts = m.content; // 只有 Anthropic 用得到分段（打缓存断点）
+      chatMsgs.push(msg);
+    }
   }
   if (chatMsgs.length === 0) chatMsgs.push({ role: 'user', content: system || '你好' });
   return { system, chatMsgs };
@@ -226,6 +260,37 @@ function extractText(protocol, data) {
     return msg.content.map((c) => (c && typeof c.text === 'string' ? c.text : '')).join('').trim();
   }
   return '';
+}
+
+// 各协议的用量字段归一成 { input, cached, output }：input 为全部输入 token（含命中缓存的部分），cached 为命中缓存的输入 token
+function extractUsage(protocol, data) {
+  if (!isObj(data)) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  if (protocol === 'anthropic') {
+    const u = data.usage;
+    if (!isObj(u)) return null;
+    return {
+      input: n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens),
+      cached: n(u.cache_read_input_tokens),
+      output: n(u.output_tokens),
+    };
+  }
+  if (protocol === 'gemini') {
+    const u = data.usageMetadata;
+    if (!isObj(u)) return null;
+    return { input: n(u.promptTokenCount), cached: n(u.cachedContentTokenCount), output: n(u.candidatesTokenCount) + n(u.thoughtsTokenCount) };
+  }
+  const u = data.usage;
+  if (!isObj(u)) return null;
+  if (protocol === 'openai-responses') {
+    return { input: n(u.input_tokens), cached: n(u.input_tokens_details && u.input_tokens_details.cached_tokens), output: n(u.output_tokens) };
+  }
+  // openai-chat：OpenAI 用 prompt_tokens_details.cached_tokens，DeepSeek 用 prompt_cache_hit_tokens
+  return {
+    input: n(u.prompt_tokens),
+    cached: n((u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || u.prompt_cache_hit_tokens),
+    output: n(u.completion_tokens),
+  };
 }
 
 function extractModelList(protocol, data) {

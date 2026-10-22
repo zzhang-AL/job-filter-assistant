@@ -31,7 +31,8 @@ export function redactProfileForAi(profile, { includeName = false } = {}) {
 }
 
 // 对岗位做脱敏拷贝：只挑分析需要的字段（不带旧的匹配结果、招呼语草稿、凭据等），键名用中文便于模型理解
-export function redactJobForAi(job, { includeCompany = true } = {}) {
+// includeActivity=false：不发 HR 活跃度（它随时间变化，会让同一岗位每次请求都不同，缓存无法命中）
+export function redactJobForAi(job, { includeCompany = true, includeActivity = true } = {}) {
   const j = job || {};
   const list = (x) => (Array.isArray(x) && x.length ? x.join('、') : '');
   const out = {
@@ -51,7 +52,7 @@ export function redactJobForAi(job, { includeCompany = true } = {}) {
     公司性质: j.companyType,
     融资阶段: j.companyStage,
     HR职位: j.hrTitle,
-    HR最近活跃: hrActivityForAi(j),
+    HR最近活跃: includeActivity ? hrActivityForAi(j) : '',
     岗位描述: typeof j.description === 'string' && j.description.trim()
       ? redactText(j.description).slice(0, 3000)
       : '（未获取到岗位描述正文）',
