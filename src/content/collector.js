@@ -111,7 +111,7 @@
     const u = location.href;
     if (PLATFORM === 'boss') {
       // 详情页：/job_detail/<encryptId>.html；地理列表页详情抽屉不改 URL，识别不到属正常
-      const m = u.match(/job_detail\/([\w-]+)\.html/) || u.match(/[?&]jobId=([\w-]+)/);
+      const m = u.match(/job_detail\/([\w~-]+)\.html/) || u.match(/[?&]jobId=([\w~-]+)/);
       return m ? m[1] : null;
     }
     if (PLATFORM === 'qcwy') {
@@ -319,7 +319,7 @@
   // —— 岗位详情页：读取 JD 正文与 HR 活跃时间 ——
   // 独立详情页 /job_detail/<id>.html 为服务端渲染，JD 在 .job-sec-text，活跃时间在 .boss-active-time。
   async function scrapeDetailPage() {
-    const m = location.pathname.match(/job_detail\/([\w-]+)\.html/);
+    const m = location.pathname.match(/job_detail\/([\w~-]+)\.html/);
     if (!m) return null;
     const jdEl = await waitFor(() => document.querySelector('.job-detail-section .job-sec-text, .job-sec-text'), 12000, 400);
     if (!jdEl) {
@@ -678,7 +678,7 @@
   function rowEncryptId(row) {
     const a = row.querySelector('a[href*="job_detail"]');
     if (!a) return null;
-    const m = a.getAttribute('href').match(/job_detail\/([\w-]+)\.html/);
+    const m = a.getAttribute('href').match(/job_detail\/([\w~-]+)\.html/);
     return m ? m[1] : null;
   }
   // 该行 HR 是否在线：先查接口捕获，再退化到 DOM 上的在线标记
@@ -847,7 +847,7 @@
     document.querySelectorAll('.job-card-wrap, li.job-card-box, .job-card-wrapper').forEach((card) => {
       const row = card.closest('li') || card;
       const a = card.querySelector('a[href*="job_detail"]') || (card.matches('a[href*="job_detail"]') ? card : null);
-      const m = a && a.getAttribute('href').match(/job_detail\/([\w-]+)\.html/);
+      const m = a && a.getAttribute('href').match(/job_detail\/([\w~-]+)\.html/);
       const id = m ? m[1] : '';
       const meta = listMeta.get(id) || {
         company: txt(card, '.boss-name') || txt(card, '.company-name'),

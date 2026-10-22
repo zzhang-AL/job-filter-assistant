@@ -223,6 +223,8 @@ test('补全队列只挑缺 JD 或详情过期、未沟通的 BOSS 岗位', () =
 test('详情页地址只认 BOSS job_detail', () => {
   assert.equal(bossDetailPageUrl({ url: 'https://evil.com/job_detail/a.html' }), '');
   assert.equal(bossDetailPageUrl({ url: 'https://www.zhipin.com/job_detail/a.html', raw: {} }), 'https://www.zhipin.com/job_detail/a.html');
+  // 加密 jobId 可能以 ~ 结尾
+  assert.equal(bossDetailPageUrl({ url: 'https://www.zhipin.com/job_detail/305d988b9e7b9e440nR62di7GA~~.html', raw: {} }), 'https://www.zhipin.com/job_detail/305d988b9e7b9e440nR62di7GA~~.html');
 });
 test('详情页 DOM 抓取的信封可归一化（jobKey 指定 uid）', () => {
   const j = normalizeResponse('boss', {

@@ -126,7 +126,7 @@ export function pickJobsNeedingDetail(list, uids, { staleMs = 24 * 3600 * 1000 }
 
 // BOSS 岗位详情页地址；带上列表卡片链接里同样的 lid / securityId，与用户从列表点进去一致
 export function bossDetailPageUrl(j) {
-  const m = String((j && j.url) || '').match(/^https:\/\/www\.zhipin\.com\/job_detail\/[\w-]+\.html/);
+  const m = String((j && j.url) || '').match(/^https:\/\/www\.zhipin\.com\/job_detail\/[\w~-]+\.html/);
   if (!m) return '';
   const q = new URLSearchParams();
   if (j.raw && j.raw.lid) q.set('lid', j.raw.lid);

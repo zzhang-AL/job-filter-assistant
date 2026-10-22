@@ -1046,7 +1046,7 @@ async function sendGreetingToChat(text, platform, url) {
 function sameJobPage(curUrl, targetUrl) {
   if (!curUrl || !targetUrl) return false;
   const id = (u) => {
-    const m = String(u).match(/job_detail\/([\w-]+)\.html/) || String(u).match(/\/job\/(\d+)/) || String(u).match(/\/(\d+)\.html/);
+    const m = String(u).match(/job_detail\/([\w~-]+)\.html/) || String(u).match(/\/job\/(\d+)/) || String(u).match(/\/(\d+)\.html/);
     return m ? m[1] : null;
   };
   const a = id(curUrl), b = id(targetUrl);
