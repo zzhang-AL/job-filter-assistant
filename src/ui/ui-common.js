@@ -91,6 +91,12 @@ export function fromList(arr) {
   return Array.isArray(arr) ? arr.join('、') : '';
 }
 
+export function fmtTime(s) {
+  if (!s) return '';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? '' : d.toLocaleString('zh-CN', { hour12: false });
+}
+
 // 防抖
 export function debounce(fn, ms = 400) {
   let t;

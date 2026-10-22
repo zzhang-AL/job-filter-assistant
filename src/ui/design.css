@@ -301,14 +301,6 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 .verdict-fair { background: linear-gradient(135deg, #ff9f0a, #ff9500); }
 .verdict-weak { background: linear-gradient(135deg, #8e8e93, #6e6e73); }
 
-/* ---------- 空状态 ---------- */
-.empty {
-  text-align: center;
-  padding: 48px 24px;
-  color: var(--text-3);
-}
-.empty .icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
-
 /* ---------- spinner ---------- */
 .spinner {
   width: 16px; height: 16px;
@@ -323,3 +315,112 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 /* fade-in */
 @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .fade-up { animation: fadeUp 0.3s var(--ease) both; }
+
+/* ============================================================
+   通用组件（侧边栏 / 设置页共用，见 components.js）
+   ============================================================ */
+/* ---------- 图标 / 小按钮 ---------- */
+.ico { display: inline-flex; align-items: center; justify-content: center; flex: none; line-height: 0; }
+.btn .ico { margin-left: -2px; }
+.btn-xs { padding: 3px 10px; font-size: 12px; gap: 4px; }
+.btn-xs .ico-svg { width: 14px; height: 14px; }
+.btn-tonal { background: var(--accent-soft); color: var(--accent); }
+.btn-tonal:hover { background: rgba(0, 113, 227, 0.16); }
+
+.icon-btn {
+  width: 30px; height: 30px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; border-radius: 8px;
+  background: transparent; color: var(--text-2);
+  cursor: pointer;
+  transition: background 0.16s var(--ease), color 0.16s var(--ease);
+}
+.icon-btn:hover { background: var(--fill); color: var(--text); }
+.icon-btn:active { background: var(--fill-2); }
+
+button:focus-visible, select:focus-visible, .jc-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.linklike { border: none; background: none; color: var(--accent); font-weight: 600; cursor: pointer; padding: 0; font-size: 13px; }
+.linklike.muted { color: var(--text-2); font-weight: 500; }
+.linklike:hover { text-decoration: underline; }
+
+.spinner-sm { width: 13px; height: 13px; border-width: 2px; }
+
+/* ---------- 提示条 notice ---------- */
+
+.notice {
+  --tone: var(--accent);
+  --tone-bg: var(--accent-soft);
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--tone-bg);
+  font-size: 12px; line-height: 1.5;
+  position: relative;
+}
+.notice-tip { --tone: var(--text-2); --tone-bg: var(--fill); }
+.notice-warn { --tone: #c76b00; --tone-bg: rgba(255, 159, 10, 0.14); }
+.notice-error { --tone: var(--red); --tone-bg: rgba(255, 59, 48, 0.1); }
+@media (prefers-color-scheme: dark) { .notice-warn { --tone: #ff9f0a; } }
+.notice-ico { color: var(--tone); margin-top: 1px; display: inline-flex; flex: none; }
+.notice-body { flex: 1; min-width: 0; }
+.notice-title { font-weight: 600; color: var(--text); font-size: 13px; }
+.notice-tip .notice-title { font-weight: 500; }
+.notice-desc { color: var(--text-2); margin-top: 1px; word-break: break-word; }
+.notice-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.notice-actions .btn:not(.btn-primary) { background: var(--bg-elevated); box-shadow: var(--shadow-sm); }
+.notice-close {
+  flex: none; width: 20px; height: 20px; margin: -2px -4px 0 0;
+  border: none; border-radius: 50%; background: transparent; color: var(--text-3);
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.notice-close:hover { background: var(--fill-2); color: var(--text); }
+/* 单行提示：标题和操作放一行 */
+.notice-compact { align-items: center; padding: 8px 12px; }
+.notice-compact .notice-ico { margin-top: 0; }
+.notice-compact .notice-body { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.notice-compact .notice-title { font-weight: 500; font-size: 12px; flex: 1; min-width: 0; }
+.notice-compact .notice-actions { margin-top: 0; }
+
+/* ---------- 弹出菜单 ---------- */
+.menu {
+  position: fixed; z-index: 1000;
+  min-width: 200px; max-width: 260px;
+  padding: 4px;
+  background: var(--bg-elevated);
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  animation: fadeUp 0.14s var(--ease) both;
+}
+.menu-item {
+  width: 100%;
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 7px 10px;
+  border: none; border-radius: 8px; background: transparent;
+  color: var(--text); text-align: left; cursor: pointer;
+  font-family: inherit;
+}
+.menu-item .ico { margin-top: 2px; color: var(--text-2); }
+.menu-item:hover, .menu-item:focus-visible { background: var(--fill); outline: none; }
+.menu-item.danger, .menu-item.danger .ico { color: var(--red); }
+.menu-text { display: flex; flex-direction: column; min-width: 0; }
+.menu-label { font-size: 13px; font-weight: 500; }
+.menu-hint { font-size: 11px; color: var(--text-3); line-height: 1.4; }
+
+/* ---------- 空状态 ---------- */
+.empty { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 48px 24px; }
+.empty-ico {
+  width: 56px; height: 56px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--fill); color: var(--text-3); margin-bottom: 6px;
+}
+.empty-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.empty-desc { font-size: 12px; color: var(--text-3); max-width: 280px; line-height: 1.5; }
+.empty .btn { margin-top: 10px; }
+
+/* popup 旧写法 */
+.empty .icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }

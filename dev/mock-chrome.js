@@ -2,6 +2,8 @@
 // 便于视觉走查与捕获渲染期 JS 错误。仅用于本地预览，不进扩展包。
 (function () {
   const listeners = [];
+  const tabRemoved = [];
+  let tabSeq = 100;
   // 内存态后端
   const state = {
     settings: {
@@ -65,10 +67,25 @@
       case 'BLOCKED_GET': return state.blocked||[];
       case 'BLOCKED_CLEAR': state.blocked=[]; return [];
       case 'CONTACTS_MARK': { const ids=new Set(msg.uids||[msg.uid]); state.jobs=state.jobs.map(j=>ids.has(j.uid)?{...j,contacted:'job'}:j); setTimeout(()=>broadcast({ type:'JOBS_UPDATED' }),0); return { jobs: state.jobs, added: ids.size }; }
-      case 'AUTO_STATUS_GET': return { running:true, pending:5, done:12, lastError:'', lastErrorAt:0 };
+      case 'AUTO_STATUS_GET': {
+        // ?pause=quota|login|verify 预览补详情暂停提示；?error=1 预览自动分析出错
+        const q = new URLSearchParams(location.search);
+        const reasons = { quota:'今日后台补全已达 120 次上限', login:'BOSS 未登录，后台补全已暂停', verify:'BOSS 触发安全验证，后台补全暂停 30 分钟' };
+        const halted = reasons[q.get('pause')] || '';
+        const detail = { running: !halted, pending: halted ? 8 : 0, halted, resumeAt: halted ? Date.now() + 47 * 60000 : 0 };
+        if (q.get('error')) return { running:false, pending:0, done:12, lastError:'AI 接口返回 401：API Key 无效或已过期', lastErrorAt:Date.now()-60000, detail };
+        return { running:true, pending:5, done:12, lastError:'', lastErrorAt:0, detail };
+      }
       case 'CONTACTS_REMOVE':
       case 'CONTACTS_GET': case 'CONTACTS_SYNC': case 'CONTACTS_CLEAR': case 'WORKER_HALT_CLEAR': return { contacts: [{ company:'示例科技', title:'前端', jobId:'', source:'chat' }, { company:'某云计算公司', title:'Web 前端', jobId:'', source:'greeting' }, { company:'某游戏公司', title:'H5 开发', jobId:'', source:'manual' }], companies: 3, syncedAt: Date.now(), halt: null };
       case 'JOB_EXPORT_REQUEST': return { format: msg.format||'json', content: JSON.stringify(state.jobs,null,2), count: state.jobs.length };
+      case 'JOB_MARK': {
+        const ids = new Set(msg.uids || [msg.uid]);
+        const now = new Date().toISOString();
+        const pick = (flag, prev) => (flag === undefined ? prev : flag ? prev || now : undefined);
+        state.jobs = state.jobs.map(j => ids.has(j.uid) ? { ...j, viewedAt: pick(msg.viewed, j.viewedAt), dismissedAt: pick(msg.dismissed, j.dismissedAt) } : j);
+        return state.jobs;
+      }
       case 'GREETING_SAVE': state.jobs = state.jobs.map(j=>j.uid===msg.uid?{...j,greetingDraft:msg.text}:j); return state.jobs;
       case 'ACTIVE_CONTEXT_REQUEST': return { platform:state.ctx.platform, url:state.ctx.url, jobKey:state.ctx.jobKey, isChat:state.ctx.isChat, platformName: state.ctx.platform==='boss'?'BOSS 直聘':'前程无忧 51job' };
       case 'SEND_GREETING': console.log('[mock] SEND_GREETING:', msg.text); return { ok:true, mode:'sent' };
@@ -80,9 +97,18 @@
       case 'PROFILE_SAVE': state.profile = msg.profile; return state.profile;
       case 'PROFILE_CLEAR': state.profile = null; return null;
       case 'AI_RESUME_EXTRACT': return { target:{jobTitles:['产品经理'],cities:['上海'],industries:[]}, basics:{yearsOfExperience:5,education:'硕士'}, capabilities:{skills:['需求分析','Axure'],strengths:['数据驱动'],industryExperience:['金融']}, workSummary:'5年产品经验', projectSummary:'', highlights:['DAU 提升30%'] };
-      case 'AI_MATCH_SCORE': { const m={score:76,verdict:'good',eligible:true,blockers:[],dims:{skill:82,experience:70,requirement:75,location:90},reasons:['演示打分','React/TS 与岗位技能吻合'],gaps:['缺少大规模 SSR 经验'],risks:[],summary:'演示总评：技能匹配度较高',greetings:{short:'演示精简开场白',standard:'演示标准开场白',detailed:'演示详细开场白'},greeting:'演示标准开场白',at:new Date().toISOString()}; state.jobs=state.jobs.map(j=>j.uid===msg.uid?{...j,match:m}:j); return m; }
+      case 'AI_MATCH_SCORE': { const m={score:76,verdict:'good',eligible:true,blockers:[],dims:{skill:82,experience:70,requirement:75,location:90},reasons:['演示打分','React/TS 与岗位技能吻合'],gaps:['缺少大规模 SSR 经验'],risks:[],summary:'演示总评：技能匹配度较高',at:new Date().toISOString()}; state.jobs=state.jobs.map(j=>j.uid===msg.uid?{...j,match:m}:j); return m; }
+      case 'AI_GREETING': {
+        const g = { short:'演示：精简版招呼语', standard:'演示：标准版招呼语，点出与岗位最相关的两点经历。', detailed:'演示：详细版招呼语……' };
+        state.jobs = state.jobs.map(j=>j.uid===msg.uid&&j.match?{...j,match:{...j.match,greetings:g,greeting:g.standard}}:j);
+        return g;
+      }
+      case 'AI_USAGE_GET': case 'AI_USAGE_RESET':
+        return msg.type === 'AI_USAGE_RESET' ? { since: Date.now(), calls:0, input:0, cached:0, output:0, localHits:0 } : { since: Date.now()-3*86400000, calls: 86, input: 214000, cached: 151000, output: 38200, localHits: 41 };
       case 'AI_MATCH_BATCH': return (msg.uids||[]).map(u=>({uid:u,ok:true,score:70}));
-      case 'BATCH_START': case 'BATCH_STATUS': case 'BATCH_CANCEL': { const n=(msg.uids||[]).length; return { running:false, total:n, detail:0, queued:0, scoring:0, ok:n, fail:0, skipped:0, skippedReasons:{}, pendingUids:[] }; }
+      case 'BATCH_START': case 'BATCH_STATUS': case 'BATCH_CANCEL': {
+        // ?batch=1 预览批量进行中的底栏进度
+        if (new URLSearchParams(location.search).get('batch')) return { running:true, total:10, detail:3, queued:1, scoring:1, ok:4, fail:1, skipped:0, skippedReasons:{}, paused: new URLSearchParams(location.search).get('pause') ? '今日后台补全已达 120 次上限' : '', resumeAt: Date.now()+47*60000, pendingUids:['boss:demo5'] }; const n=(msg.uids||[]).length; return { running:false, total:n, detail:0, queued:0, scoring:0, ok:n, fail:0, skipped:0, skippedReasons:{}, pendingUids:[] }; }
       case 'AI_TAILOR_RESUME': return {
         matchedSkills:['React','TypeScript','组件库建设','性能优化'],
         missingSkills:['大规模 SSR'],
@@ -131,7 +157,13 @@
       state.ctx = { platform, jobKey, isChat: !!isChat, url: platform==='boss'?`https://www.zhipin.com/web/geek/jobs`:`https://we.51job.com/pc/search` };
       broadcast({ type: 'CURRENT_JOB', platform, jobKey });
     },
-    tabs: { query: async()=>[{ id:1, windowId:1, url:'https://www.zhipin.com/web/geek/jobs' }], create: (o)=>console.log('[mock] tabs.create', o.url) },
+    // 测试辅助：__mockCloseTab() 模拟关掉最近一次用 tabs.create 打开的标签页
+    __mockCloseTab: () => { const id = tabSeq; tabRemoved.forEach((fn) => fn(id)); },
+    tabs: {
+      query: async()=>[{ id:1, windowId:1, url:'https://www.zhipin.com/web/geek/jobs' }],
+      create: async (o) => { console.log('[mock] tabs.create', o.url); return { id: ++tabSeq, url: o.url }; },
+      onRemoved: { addListener: (fn) => tabRemoved.push(fn) },
+    },
     sidePanel: { open: async()=>console.log('[mock] sidePanel.open'), setPanelBehavior: async()=>{} },
     downloads: { download: async(o)=>{ console.log('[mock] download', o.filename); return 1; } },
   };
