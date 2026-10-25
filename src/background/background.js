@@ -306,7 +306,7 @@ async function startBatch(uids, { force = false } = {}) {
   for (const uid of list) {
     const job = jobs.get(uid);
     if (!job) batchSkip(uid, '岗位已不在库中');
-    else if (job.contacted) batchSkip(uid, '已沟通');
+    else if (job.contacted === 'job') batchSkip(uid, '已沟通'); // 只跳过沟通过的这个岗位，同公司的其他岗位照常分析
     else if (isDetailReady(job)) batchQueueScore(uid);
     else if (job.platform === 'boss' && bossDetailPageUrl(job)) {
       batch.state.set(uid, 'detail');
@@ -698,7 +698,7 @@ function resolveDetailWaiters(uid, reason = detailHalted) {
 }
 
 // ============ 自动分析 ============
-// 待分析列表不放在内存里，而是每次从岗位库算出来：详情已就绪、还没分析、未沟通、未被本地筛选剔除的岗位。
+// 待分析列表不放在内存里，而是每次从岗位库算出来：详情已就绪、还没分析、这个岗位没沟通过、未被本地筛选剔除的岗位。
 // 这样插件后台被 Chrome 回收（空闲 30 秒、或 AI 请求太久）后也不会丢——每分钟的闹钟和后台启动时都会接着跑。
 // 串行执行，HR 最活跃的先分析；同一岗位连续失败 AUTO_MAX_FAILS 次后不再自动重试（可手动分析）。
 const AUTO_MAX_FAILS = 2;
@@ -729,7 +729,7 @@ function autoCandidates(jobs, settings) {
     (j) =>
       isDetailReady(j) &&
       !j.match &&
-      !j.contacted &&
+      j.contacted !== 'job' && // 沟通过同公司的其他岗位不算，照常分析
       !j.dismissedAt && // 标了不感兴趣的不花 AI 调用；恢复后会重新进入候选
       (j.autoScoreFails || 0) < AUTO_MAX_FAILS &&
       !inActiveBatch(j.uid) && // 正在批量分析里的交给批量，避免同一岗位分析两次

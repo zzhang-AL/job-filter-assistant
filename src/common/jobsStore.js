@@ -112,12 +112,12 @@ export function isDetailReady(j) {
 }
 
 // 从给定岗位里挑出需要补抓详情的（无 JD，或详情已超过 staleMs 未刷新——HR 活跃时间会过期）。
-// 只处理有独立详情页的 BOSS 岗位；已沟通的不再补。
+// 只处理有独立详情页的 BOSS 岗位；沟通过的这个岗位不再补（同公司的其他岗位照常补，供匹配用）。
 export function pickJobsNeedingDetail(list, uids, { staleMs = 24 * 3600 * 1000 } = {}) {
   const want = new Set(uids);
   const now = Date.now();
   return list
-    .filter((j) => want.has(j.uid) && j.platform === 'boss' && !j.contacted && bossDetailPageUrl(j))
+    .filter((j) => want.has(j.uid) && j.platform === 'boss' && j.contacted !== 'job' && bossDetailPageUrl(j))
     .filter((j) => !j.description || !j.detailAt || now - Date.parse(j.detailAt) > staleMs)
     // 列表里 HR 在线的先补（更可能在招），其余保持列表顺序
     .sort((a, b) => (b.hrOnline === true) - (a.hrOnline === true))
