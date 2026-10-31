@@ -1001,12 +1001,13 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
   }
   refreshRunning = true;
   try {
-    const [jobs, settings, history] = await Promise.all([loadJobs(), loadSettings(), loadApplyHistory()]);
+    const [jobs, settings, history, blocked] = await Promise.all([loadJobs(), loadSettings(), loadApplyHistory(), loadBlocked()]);
     const cfg = settings.autoApply;
     if (!cfg.enabled && !force) {
       await updateActionBadge();
       return null;
     }
+    const blockedSet = new Set((blocked || []).map((b) => b.uid));
     const cur = await loadApplyBatch();
     // 投递跨过午夜时不要滚动到新清单：否则后台标记结果找不到旧条目，当天状态会丢
     const dayKey = applyRun && applyRun.state === 'running' && cur.date ? cur.date : dateKey();
@@ -1015,7 +1016,7 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
     const next = await updateApplyBatch((batch) => {
       const merged = mergeApplyBatch(batch, cands, { dateKey: dayKey });
       added = merged.added;
-      return reconcileApplyBatch(merged.batch, jobs, history, cfg);
+      return reconcileApplyBatch(merged.batch, jobs, history, cfg, blockedSet);
     });
     if (notify && added) broadcast(MSG.APPLY_UPDATED, { added, pending: countApply(next.items).pending });
     await updateActionBadge();
@@ -1031,11 +1032,13 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
   }
 }
 
-function reconcileApplyBatch(batch, jobs, history, cfg) {
+function reconcileApplyBatch(batch, jobs, history, cfg, blockedSet) {
   const byUid = new Map((jobs || []).map((j) => [j.uid, j]));
   const now = Date.now();
   const STALE_MS = 5 * 60 * 1000;
   const items = (batch.items || []).map((it) => {
+    // 用户明确屏蔽的岗位：即使岗位库已经移除了它，也不能再投
+    if (blockedSet && blockedSet.has(it.uid)) return { ...it, status: 'skipped', note: '已屏蔽' };
     // 上一次投递中途被浏览器 / Service Worker 终止：超过 5 分钟仍停在「投递中」就允许重试
     if (it.status === 'applying') {
       const t = Date.parse(it.updatedAt || it.addedAt || '');
@@ -1312,7 +1315,8 @@ async function runApplyQueue(items) {
 // 单个岗位：打开详情页 → content-script 点「立即沟通」→ 等页面进入聊天页 → 记为已沟通。
 // 只发起沟通，不自动发送任何消息；招呼语只在有草稿时预填。
 async function applyOne(item, cfg) {
-  const jobs = await loadJobs();
+  const [jobs, blocked] = await Promise.all([loadJobs(), loadBlocked()]);
+  if ((blocked || []).some((b) => b.uid === item.uid)) return { ok: true, skipped: true, reason: '已屏蔽' };
   const stored = jobs.find((j) => j.uid === item.uid);
   // 岗位可能已被岗位库容量策略淘汰，但用户已经确认过这条清单：用快照里的链接继续投
   const job = stored || {
