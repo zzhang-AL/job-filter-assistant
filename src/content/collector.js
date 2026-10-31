@@ -522,6 +522,11 @@
   async function autoClickStartChat(text, expectedJobId) {
     const blocked = detectBlockedPage();
     if (blocked) return { ok: false, blocked };
+    // 中介 / 经纪人岗位点「立即沟通」会先弹「您已对中介等经纪人隐藏简历」，
+    // 需要展示简历才能继续；按用户要求这类岗位直接跳过，不点弹窗的「继续」。
+    if (/您已对中介等经纪人隐藏简历|主动与经纪人联系，经纪人将看见您的简历/.test(String((document.body && document.body.innerText) || ''))) {
+      return { ok: true, skipped: true, reason: '中介/经纪人岗位，需要主动展示简历，已跳过' };
+    }
     const m = location.pathname.match(/job_detail\/([\w~-]+)\.html/);
     const jobKey = m ? m[1] : '';
     // 目标岗位校验：岗位下架后可能被重定向到别的岗位 / 非详情页，绝不能对着错误页面点沟通
@@ -589,12 +594,15 @@
     const start = findStartChatButton();
     const blocked = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
     const limited = /沟通次数|打招呼次数|今日.{0,6}(上限|次数)|操作过于频繁|请稍后再试/.test(body);
+    const agentModal = /您已对中介等经纪人隐藏简历|主动与经纪人联系，经纪人将看见您的简历/.test(body);
     return {
       ok: true,
       chat: !!input,
       label: start ? String(start.textContent || '').trim() : '',
       blocked,
       limited,
+      skipped: agentModal,
+      reason: agentModal ? '中介/经纪人岗位，需要主动展示简历，已跳过' : '',
       title: String(document.title || ''),
       text: body.replace(/\s+/g, ' ').slice(0, 200),
     };

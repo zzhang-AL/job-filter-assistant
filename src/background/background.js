@@ -1594,6 +1594,7 @@ async function applyOne(item, cfg) {
       return { ok: false, blocked: true, error: why };
     }
     if (!res || !res.ok) return { ok: false, error: (res && res.error) || '页面没有响应' };
+    if (res.skipped) return { ok: true, skipped: true, reason: res.reason || '已跳过' };
     if (res.mode === 'already') {
       // 页面显示「继续沟通」：说明已经在别处沟通过（可能是手动聊过、同步漏了）。
       // 也要写入沟通记录 / 历史，否则明天还会被当成未沟通岗位重新推荐。
@@ -1609,6 +1610,7 @@ async function applyOne(item, cfg) {
         await setHalt(why, nav.blocked === 'login' ? 10 * 60 * 1000 : 30 * 60 * 1000, nav.blocked);
         return { ok: false, blocked: true, error: why };
       }
+      if (nav.skipped) return { ok: true, skipped: true, reason: nav.reason || '已跳过' };
       if (nav.limited) return { ok: false, limited: true, error: nav.error || 'BOSS 提示沟通次数已达上限，已停止投递' };
       if (nav.unconfirmed) {
         // 已经点击并进入聊天页，只是无法确认会话身份。不要让它打断整批投递：
@@ -1723,6 +1725,7 @@ async function waitForChatTab(tabId, timeoutMs, job) {
       if (done || !state) return;
       lastState = state;
       if (state.blocked) { finish({ ok: false, blocked: state.blocked, title: state.title }); return; }
+      if (state.skipped) { finish({ ok: false, skipped: true, reason: state.reason || '中介/经纪人岗位，已跳过' }); return; }
       if (state.limited) {
         finish({ ok: false, limited: true, error: 'BOSS 提示沟通次数已达上限，已停止投递', title: state.title });
         return;
