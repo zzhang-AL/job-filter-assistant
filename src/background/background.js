@@ -355,8 +355,12 @@ const tierOf = taskTier;
 
 function enqueueDetails(items, tab, { front = false, batch = false, daily = false } = {}) {
   if (tab && tab.id != null && !isWorkerTab(tab.id)) progressTab = tab;
+  // 普通 / 每日补全排队上限：长时间挂起时不要无限堆积 URL 和任务对象；
+  // 用户主动点的 urgent / 批量任务不受此限制。
+  const MAX_DETAIL_QUEUE = 400;
   for (const it0 of items) {
     if (!it0 || !it0.url) continue;
+    if (!front && !batch && detailQueue.length >= MAX_DETAIL_QUEUE) break;
     const it = { ...it0, urgent: front || undefined, batch: batch || undefined, daily: daily || undefined };
     // 已登记但不在队列里 = 正在处理中，不重复加
     if (detailQueued.has(it.uid) && !detailQueue.some((x) => x.uid === it.uid)) continue;
@@ -921,9 +925,23 @@ async function ensureDetail(job) {
   const halt = await getHalt();
   if (halt && !isLoginHalt(halt)) return; // 「未登录」不拦：插队任务是 urgent，会打开一次重试
   await new Promise((resolve) => {
-    const timer = setTimeout(resolve, 60000);
+    let done = false;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const list = detailWaiters.get(job.uid);
+      if (list) {
+        const i = list.indexOf(finish);
+        if (i >= 0) list.splice(i, 1);
+        if (!list.length) detailWaiters.delete(job.uid);
+      }
+      resolve();
+    };
+    timer = setTimeout(finish, 60000);
     const list = detailWaiters.get(job.uid) || [];
-    list.push(() => { clearTimeout(timer); resolve(); });
+    list.push(finish);
     detailWaiters.set(job.uid, list);
     enqueueDetails([{ uid: job.uid, jobId: job.jobId, url }], null, { front: true });
   });

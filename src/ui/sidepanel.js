@@ -62,6 +62,12 @@ const openedTabs = new Map(); // tabId -> uid
 const reviewing = new Set(); // 正在显示「看完了？」提示的 uid
 const REVIEW_TTL = 3 * 60 * 1000;
 
+// 会话态缓存设上限：用户长时间开着侧边栏翻很多岗位时，避免无限占内存
+function cacheSet(map, key, val, max) {
+  map.set(key, val);
+  while (map.size > max) map.delete(map.keys().next().value);
+}
+
 async function boot() {
   await reload();
   // 后台有正在进行的批量（侧边栏关掉期间仍在跑，或后台重启后恢复的）：接上进度
@@ -903,7 +909,7 @@ async function blockJobsUi(uids) {
 async function openOriginal(job) {
   // 多次点击以第一次为准，记的是卡片原本的位置
   if (!sortFrozen.has(job.uid)) {
-    sortFrozen.set(job.uid, { lastSeenAt: job.lastSeenAt, savedAt: job.savedAt, hrActiveText: job.hrActiveText, hrOnline: job.hrOnline });
+    cacheSet(sortFrozen, job.uid, { lastSeenAt: job.lastSeenAt, savedAt: job.savedAt, hrActiveText: job.hrActiveText, hrOnline: job.hrOnline }, 500);
   }
   reviewing.delete(job.uid);
   const tab = await chrome.tabs.create({ url: job.url });
@@ -1202,7 +1208,7 @@ function renderGreeting(panel, job) {
           view.greetLevel = lv.key;
           // 切换档位时用该档 AI 文案覆盖编辑区（并存为草稿）
           const text = greetingsOf(job.match)[lv.key] || '';
-          greetingCache.set(job.uid, text);
+          cacheSet(greetingCache, job.uid, text, 200);
           persistGreeting(job.uid, text);
           render();
         },
@@ -1218,7 +1224,7 @@ function renderGreeting(panel, job) {
   greetingTextarea = ta;
   const counter = h('span', { class: 'greet-count', text: `${value.length} 字` });
   ta.addEventListener('input', () => {
-    greetingCache.set(job.uid, ta.value);
+    cacheSet(greetingCache, job.uid, ta.value, 200);
     counter.textContent = `${ta.value.length} 字`;
     persistGreetingDebounced(job.uid, ta.value);
   });
@@ -1329,7 +1335,7 @@ async function tailorAdvice(job) {
   render();
   try {
     const advice = await send(MSG.AI_TAILOR_RESUME, { uid: job.uid, job });
-    tailorCache.set(job.uid, advice);
+    cacheSet(tailorCache, job.uid, advice, 30);
     toast('简历建议已生成');
   } catch (e) {
     toast(`生成失败：${e.message}`, true);
@@ -1772,7 +1778,7 @@ async function sendGreeting(job) {
     if (!confirm(`确认发送给 ${job.company || 'HR'}？\n\n${text}`)) return;
   }
   // 以当前文本为准，落库
-  greetingCache.set(job.uid, text);
+  cacheSet(greetingCache, job.uid, text, 200);
   persistGreeting(job.uid, text);
   // 先复制到剪贴板兜底（无论聊天能否自动填入，招呼语都在手上）
   copyText(text);
@@ -1811,7 +1817,7 @@ async function generateGreetingUi(job, force = false) {
     if (force) toast('已重新生成招呼语');
     return true;
   } catch (e) {
-    greetFailed.set(job.uid, e.message);
+    cacheSet(greetFailed, job.uid, e.message, 200);
     toast(e.message, true);
     return false;
   } finally {

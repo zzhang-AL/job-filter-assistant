@@ -773,7 +773,10 @@
       if (!Array.isArray(list)) return;
       for (const j of list) {
         const id = j && (j.encryptJobId || j.jobId);
-        if (id) bossOnlineMap.set(String(id), !!j.bossOnline);
+        if (!id) continue;
+        bossOnlineMap.set(String(id), !!j.bossOnline);
+        // 长时间不刷新页面时，推荐 / 搜索列表可能积累很多岗位；只保留最近 2000 个
+        if (bossOnlineMap.size > 2000) bossOnlineMap.delete(bossOnlineMap.keys().next().value);
       }
     } catch {}
   }
@@ -944,7 +947,9 @@
       if (!Array.isArray(list)) return;
       for (const j of list) {
         const id = j && (j.encryptJobId || j.jobId);
-        if (id) listMeta.set(String(id), { company: String(j.brandName || ''), title: String(j.jobName || '') });
+        if (!id) continue;
+        listMeta.set(String(id), { company: String(j.brandName || ''), title: String(j.jobName || '') });
+        if (listMeta.size > 2000) listMeta.delete(listMeta.keys().next().value);
       }
     } catch {}
   }
