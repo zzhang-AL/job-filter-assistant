@@ -1321,7 +1321,8 @@ function applyCountText() {
   if (!applyStatus) return '投递清单';
   const c = (applyStatus.batch && applyStatus.batch.counts) || {};
   const date = (applyStatus.batch && applyStatus.batch.date) || '';
-  return `${date ? date + ' · ' : ''}待确认 ${c.pending || 0} · 已沟通 ${c.applied || 0}`;
+  const closed = c.rejected ? ` · 已关闭 ${c.rejected}` : '';
+  return `${date ? date + ' · ' : ''}待确认 ${c.pending || 0} · 已沟通 ${c.applied || 0}${closed}`;
 }
 
 function renderApplyStatusBar() {
@@ -1359,9 +1360,23 @@ function sortedApplyItems(items) {
 
 function fillApplyList(listEl) {
   listEl.innerHTML = '';
-  const items = sortedApplyItems((applyStatus && applyStatus.batch && applyStatus.batch.items) || []);
+  const all = sortedApplyItems((applyStatus && applyStatus.batch && applyStatus.batch.items) || []);
+  // 已关闭的岗位从清单里移除，只留在统计里；避免关闭后还占着列表
+  const items = all.filter((it) => it.status !== 'rejected');
   if (!items.length) {
     const cfg = (applyStatus && applyStatus.config) || {};
+    const counts = (applyStatus && applyStatus.batch && applyStatus.batch.counts) || {};
+    if (all.length) {
+      listEl.appendChild(
+        emptyState(
+          'check',
+          '今天的投递清单已处理完',
+          `已关闭 ${counts.rejected || 0} 个岗位；明天会重新生成清单，也可以在设置里调高每日清单上限。`,
+          { label: '刷新清单', onClick: refreshApplyUi },
+        ),
+      );
+      return;
+    }
     const hasKeywords = Array.isArray(cfg.keywords) && cfg.keywords.length > 0;
     listEl.appendChild(
       emptyState(
@@ -1382,10 +1397,12 @@ function fillApplyList(listEl) {
 
 function renderApplyCard(it) {
   const pending = it.status === 'pending';
+  const running = !!(applyStatus && applyStatus.run && applyStatus.run.state === 'running');
+  const canEdit = pending && !running;
   const on = applyChecked.has(it.uid);
   const cb = h('input', { type: 'checkbox' });
   cb.checked = on;
-  cb.disabled = !pending;
+  cb.disabled = !canEdit;
   const card = h('div', { class: 'job-card apply-card' + (on ? ' is-checked' : '') + (pending ? '' : ' is-done') });
   cb.addEventListener('change', () => {
     if (cb.checked) applyChecked.add(it.uid);
@@ -1409,7 +1426,7 @@ function renderApplyCard(it) {
       h('div', { class: 'apply-side' }, [
         h('div', { class: 'apply-score', text: String(it.score || 0) }),
         statusChip,
-        (it.status === 'pending' || it.status === 'failed')
+        (it.status === 'pending' || it.status === 'failed') && !running
           ? h('button', {
               class: 'linklike muted apply-close',
               text: '不想要',

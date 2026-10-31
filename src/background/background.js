@@ -255,35 +255,6 @@ async function onJobsCaptured(msg, sender) {
   let jobs = normalizeResponse(msg.platform, msg.payload, { url: msg.url, jobKey: msg.jobKey });
   if (!jobs.length) return { added: 0, updated: 0 };
 
-  // 每日自动搜索打开的后台标签页：列表阶段先按用户配置的年限 / 薪资 / 城市 / HR 活跃粗筛，
-  // 避免把大量明显不合适的岗位排进详情补全和 AI 分析（省时间也省 token）。
-  const autoCfg = settings.autoApply;
-  if (autoSearch && autoCfg) {
-    const rawCount = jobs.length;
-    jobs = jobs.filter((j) => matchSearchFilter(j, autoCfg).keep);
-    searchSeen += rawCount; // 用过滤前的数量判断「有没有搜到」，避免条件过严被误报成没搜到
-    if (!jobs.length) return { added: 0, updated: 0, filtered: true };
-    // 每天自动收录数量上限：只给「库里还没有的新岗位」占名额；
-    // 重复出现的岗位仍更新列表字段（HR 在线 / 活跃），但不消耗当天额度。
-    const existingUids = new Set((await loadJobs()).map((j) => j.uid));
-    const fresh = [];
-    const freshSeen = new Set(existingUids);
-    for (const j of jobs) {
-      if (!j.uid || freshSeen.has(j.uid)) continue;
-      freshSeen.add(j.uid);
-      fresh.push(j);
-    }
-    const slots = await reserveCollectSlots(fresh.length, autoCfg);
-    if (slots < fresh.length) searchCapped = true;
-    if (fresh.length && !slots) {
-      jobs = jobs.filter((j) => existingUids.has(j.uid));
-      if (!jobs.length) return { added: 0, updated: 0, capped: true };
-    } else if (fresh.length) {
-      const allowed = new Set(fresh.slice(0, slots).map((j) => j.uid));
-      jobs = jobs.filter((j) => existingUids.has(j.uid) || allowed.has(j.uid));
-    }
-  }
-
   // 屏蔽名单：永远不收录；已沟通：不新增（库里已有的照常更新并打标）
   const [blockedList, contacts] = await Promise.all([loadBlocked(), loadContacts()]);
   const blocked = new Set(blockedList.map((b) => b.uid));
@@ -294,6 +265,37 @@ async function onJobsCaptured(msg, sender) {
     if (st) j.contacted = st;
     else delete j.contacted;
   }
+
+  // 每日自动搜索打开的后台标签页：列表阶段先按用户配置的年限 / 薪资 / 城市 / HR 活跃粗筛，
+  // 避免把大量明显不合适的岗位排进详情补全和 AI 分析（省时间也省 token）。
+  const autoCfg = settings.autoApply;
+  if (autoSearch && autoCfg) {
+    const rawCount = jobs.length;
+    jobs = jobs.filter((j) => matchSearchFilter(j, autoCfg).keep);
+    searchSeen += rawCount; // 用过滤前的数量判断「有没有搜到」，避免条件过严被误报成没搜到
+    if (!jobs.length) return { added: 0, updated: 0, filtered: true };
+    // 每天自动收录数量上限：只给「库里还没有、且不会被屏蔽 / 已沟通规则跳过」的新岗位占名额；
+    // 重复出现的岗位仍更新列表字段（HR 在线 / 活跃），但不消耗当天额度。
+    const existingUids = new Set((await loadJobs()).map((j) => j.uid));
+    const fresh = [];
+    const freshSeen = new Set(existingUids);
+    for (const j of jobs) {
+      if (!j.uid || freshSeen.has(j.uid)) continue;
+      freshSeen.add(j.uid);
+      fresh.push(j);
+    }
+    const acceptable = (j) =>
+      !blocked.has(j.uid) &&
+      (!settings.skipContacted || j.contacted !== 'job') &&
+      (!settings.skipContacted || autoCfg.includeCompanyContacted || j.contacted !== 'company');
+    const acceptedFresh = fresh.filter(acceptable);
+    const slots = await reserveCollectSlots(acceptedFresh.length, autoCfg);
+    if (slots < acceptedFresh.length) searchCapped = true;
+    const allowed = new Set(acceptedFresh.slice(0, slots).map((j) => j.uid));
+    jobs = jobs.filter((j) => existingUids.has(j.uid) || allowed.has(j.uid));
+    if (!jobs.length) return { added: 0, updated: 0, capped: true };
+  }
+
   const accept = (raw, prev) => {
     if (blocked.has(raw.uid)) return false;
     if (prev || !settings.skipContacted) return true;
@@ -1055,8 +1057,10 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
     const cur = await loadApplyBatch();
     // 投递跨过午夜时不要滚动到新清单：否则后台标记结果找不到旧条目，当天状态会丢
     const dayKey = applyRun && applyRun.state === 'running' && cur.date ? cur.date : dateKey();
-    // 只有和当前清单同一天时才把已有条目算进每日名额；跨天时旧清单不计入新一天
-    const existingForPick = cur.date && cur.date === dayKey ? cur.items : [];
+    // 只有和当前清单同一天时才把已有条目算进每日名额；跨天时只把「投递中」的条目带进新一天
+    const existingForPick = cur.date && cur.date === dayKey
+      ? cur.items
+      : (cur.items || []).filter((it) => it.status === 'applying');
     const cands = pickApplyCandidates(jobs, cfg, { existing: existingForPick, history });
     let added = 0;
     const next = await updateApplyBatch((batch) => {
@@ -1322,6 +1326,12 @@ async function runApplyQueue(items) {
       if (halt) {
         applyRun.error = halt.reason;
         break;
+      }
+      // 用户可能在投递过程中把后面的岗位关掉 / 屏蔽：执行前再读一次最新状态，别把已关闭的再投出去
+      const latest = (await loadApplyBatch()).items.find((x) => x.uid === it.uid);
+      if (!latest || latest.status !== 'pending') {
+        applyRun.done++;
+        continue;
       }
       applyRun.current = it.uid;
       broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
