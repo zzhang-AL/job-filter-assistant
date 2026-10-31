@@ -251,7 +251,9 @@ async function onJobsCaptured(msg, sender) {
   // 每日任务也要能收录，否则搜索会一直判 empty、清单永远出不来。
   const role = sender.tab ? tabTaskOf(sender.tab.id).role : null;
   const autoSearch = role === 'search';
-  if (!settings.autoCapture && !autoSearch) return { added: 0, updated: 0, skipped: true };
+  // 后台任务页（详情 / 搜索 / 沟通）是插件自己打开的，不受「自动收录」开关影响；
+  // 只有用户自己浏览的页面关掉自动收录才不收录。
+  if (!settings.autoCapture && !role) return { added: 0, updated: 0, skipped: true };
   let jobs = normalizeResponse(msg.platform, msg.payload, { url: msg.url, jobKey: msg.jobKey });
   if (!jobs.length) return { added: 0, updated: 0 };
 
