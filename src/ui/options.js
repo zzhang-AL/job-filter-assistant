@@ -877,9 +877,14 @@ async function testProv(prov, el) {
 async function fetchModels(prov, el) {
   setResult(el, 'busy', '拉取模型中…');
   try {
-    prov.discoveredModels = await send(MSG.AI_PROVIDER_MODELS, { provider: prov });
+    const list = await send(MSG.AI_PROVIDER_MODELS, { provider: prov });
+    prov.discoveredModels = Array.isArray(list) ? list : [];
     await saveProviders(providers);
-    toast(`发现 ${prov.discoveredModels.length} 个模型，已加到模型输入框的下拉候选`);
+    if (!prov.discoveredModels.length) {
+      setResult(el, 'err', '接口没有返回模型列表。部分供应商不支持列出模型，可手动填写模型 ID，或在「高级设置」里填写自定义模型列表 URL。');
+      return;
+    }
+    toast(`发现 ${prov.discoveredModels.length} 个模型，可在模型 ID 下方下拉框选择`);
     route();
   } catch (e) {
     setResult(el, 'err', e.message + '（部分供应商不支持列出模型，可手动填写模型 ID）');
