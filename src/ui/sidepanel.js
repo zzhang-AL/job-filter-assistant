@@ -1351,9 +1351,7 @@ async function tailorAdvice(job) {
 function applyCountText() {
   if (!applyStatus) return '投递清单';
   const c = (applyStatus.batch && applyStatus.batch.counts) || {};
-  const date = (applyStatus.batch && applyStatus.batch.date) || '';
-  const closed = c.rejected ? ` · 已关闭 ${c.rejected}` : '';
-  return `${date ? date + ' · ' : ''}待确认 ${c.pending || 0} · 已沟通 ${c.applied || 0}${closed}`;
+  return `待确认 ${c.pending || 0} · 已沟通 ${c.applied || 0}`;
 }
 
 function renderApplyStatusBar() {
@@ -1364,6 +1362,16 @@ function renderApplyStatusBar() {
     return box;
   }
   const s = st.search || {};
+  const counts = (st.batch && st.batch.counts) || {};
+  const collect = st.collect || {};
+  const cfg = st.config || {};
+  box.appendChild(
+    h('div', { class: 'apply-meta' }, [
+      h('span', { class: 'apply-meta-item', text: `今日收录 ${collect.count || 0}/${collect.cap || 0}` }),
+      h('span', { class: 'apply-meta-item', text: `清单 ${counts.total || 0}/${cfg.dailyCap || 0}` }),
+      st.batch?.date ? h('span', { class: 'apply-meta-item muted', text: st.batch.date }) : null,
+    ]),
+  );
   if (s.running) {
     box.appendChild(notice({ tone: 'tip', ic: 'refresh', compact: true, title: '正在自动搜索 BOSS…', desc: '完成后自动补详情、AI 匹配，新岗位会补进今日清单' }));
   } else if (s.lastSearchStatus === 'error') {
@@ -1462,14 +1470,6 @@ function renderApplyCard(it) {
       h('div', { class: 'apply-side' }, [
         h('div', { class: 'apply-score', text: String(it.score || 0) }),
         statusChip,
-        (it.status === 'pending' || it.status === 'failed') && !running
-          ? h('button', {
-              class: 'linklike muted apply-close',
-              text: '不想要',
-              title: '不想要：从清单关闭，并从以后推荐中排除（可在岗位库恢复）',
-              onclick: (e) => { e.stopPropagation(); rejectApplyItem(it); },
-            })
-          : null,
       ]),
     ]),
     it.summary ? h('div', { class: 'jc-summary tone-' + (it.verdict || 'fair'), text: it.summary }) : null,
@@ -1479,10 +1479,20 @@ function renderApplyCard(it) {
       it.hasGreeting ? h('span', { class: 'chip', text: '有招呼语草稿' }) : null,
     ].filter(Boolean)),
     it.note ? h('div', { class: 'apply-note', text: it.note }) : null,
-    it.status === 'failed'
+    (it.status === 'pending' || it.status === 'failed')
       ? h('div', { class: 'apply-card-actions' }, [
-          h('button', { class: 'linklike', text: '重试', onclick: (e) => { e.stopPropagation(); retryApplyItem(it); } }),
-        ])
+          it.status === 'failed'
+            ? h('button', { class: 'btn btn-xs btn-ghost', text: '重试', onclick: (e) => { e.stopPropagation(); retryApplyItem(it); } })
+            : null,
+          !running
+            ? h('button', {
+                class: 'btn btn-xs btn-ghost danger-text',
+                text: '不想要',
+                title: '从清单关闭，并从以后推荐中排除（可在岗位库恢复）',
+                onclick: (e) => { e.stopPropagation(); rejectApplyItem(it); },
+              })
+            : null,
+        ].filter(Boolean))
       : null,
   ].filter(Boolean);
   card.append(...children);
@@ -1500,6 +1510,7 @@ function fillApplyBottom(bar) {
   bar.innerHTML = '';
   bar.className = 'sp-bottom';
   const st = applyStatus;
+  const items = (st && st.batch && st.batch.items) || [];
   const run = st && st.run;
   if (run && run.state === 'running') {
     bar.classList.add('is-batch');
@@ -1514,12 +1525,13 @@ function fillApplyBottom(bar) {
           h('button', { class: 'btn btn-xs btn-danger', text: '停止', onclick: stopApplyUi }),
         ]),
         h('div', { class: 'progress' }, [h('span', { class: 'progress-fill', style: `width:${pct}%` })]),
-        run.current ? h('div', { class: 'batch-sub', text: '正在打开岗位页并点击「立即沟通」…' }) : null,
+        run.current
+          ? h('div', { class: 'batch-sub', text: `正在处理：${(items.find((it) => it.uid === run.current) || {}).title || '当前岗位'} · 打开页面并点击「立即沟通」` })
+          : null,
       ]),
     );
     return;
   }
-  const items = (st && st.batch && st.batch.items) || [];
   const pending = items.filter((it) => it.status === 'pending');
   const selected = pending.filter((it) => applyChecked.has(it.uid));
   if (selected.length) {
@@ -1537,7 +1549,7 @@ function fillApplyBottom(bar) {
     bar.appendChild(
       h('div', { class: 'sel-actions' }, [
         h('button', { class: 'btn btn-sm btn-primary grow', onclick: confirmApply }, [icon('send'), `确认投递 ${selected.length} 个`]),
-        h('button', { class: 'btn btn-sm', text: '关闭所选', onclick: closeApplySelected }),
+        h('button', { class: 'btn btn-sm btn-ghost danger-text', text: '关闭所选', onclick: closeApplySelected }),
         iconBtn('more', '更多', (e) =>
           openMenu(e.currentTarget, [
             { icon: 'refresh', label: '刷新清单', hint: '把新匹配的岗位补进来', onClick: refreshApplyUi },
@@ -1549,13 +1561,15 @@ function fillApplyBottom(bar) {
     return;
   }
   bar.appendChild(
-    h('button', { class: 'btn btn-sm btn-ghost', disabled: !pending.length, onclick: selectAllApply }, [
-      icon('check'),
-      `全选待确认（${pending.length}）`,
-    ]),
+    h('button', {
+      class: 'btn btn-sm ' + (pending.length ? 'btn-primary' : 'btn-ghost'),
+      disabled: !pending.length,
+      title: '先全选待确认岗位，再点「确认投递」',
+      onclick: selectAllApply,
+    }, [icon('check'), pending.length ? `全选待确认（${pending.length}）` : '没有待确认岗位']),
   );
   bar.appendChild(h('div', { class: 'spacer' }));
-  bar.appendChild(h('button', { class: 'btn btn-sm', onclick: refreshApplyUi }, [icon('refresh'), '刷新清单']));
+  bar.appendChild(h('button', { class: 'btn btn-sm btn-ghost', onclick: refreshApplyUi }, [icon('refresh'), '刷新清单']));
 }
 
 async function refreshApplyUi() {

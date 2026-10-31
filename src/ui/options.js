@@ -1126,7 +1126,7 @@ function renderAutoApply() {
       tone: 'warn',
       ic: 'alert',
       title: '自动投递会真实点击「立即沟通」',
-      desc: '每天定时在后台打开 BOSS 搜索页收录岗位，完成后生成待确认清单；只有你在侧边栏点「确认投递」后，才会逐个打开岗位页点「立即沟通」。不会自动发送任何聊天消息。请控制数量、保持默认节奏，并遵守平台服务条款。',
+      desc: '每天定时后台搜索并生成待确认清单；只有你在侧边栏点「确认投递」才会逐个点「立即沟通」，不会自动发消息。请控制数量并遵守平台服务条款。',
     }),
   );
 
@@ -1172,20 +1172,21 @@ function renderAutoApply() {
       statusBox.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '自动 AI 分析未开启', desc: '投递清单依赖匹配分，请先到「自动化」开启自动 AI 分析。', actions: [{ label: '去开启', primary: true, onClick: () => go('automation') }] }));
     }
 
+    const collect = st.collect || {};
+    const listCap = (st.config && st.config.dailyCap) || 0;
     const stat = h('div', { class: 'auto-stats' }, [
       statCell('待确认', counts.pending || 0, 'accent'),
       statCell('已沟通', counts.applied || 0, 'green'),
       statCell('已关闭', counts.rejected || 0, 'muted'),
-      statCell('清单日期', st.batch?.date || '—', 'muted'),
+      statCell('今日收录', `${collect.count || 0}/${collect.cap || 0}`, 'muted'),
     ]);
     statusBox.appendChild(stat);
-    const collect = st.collect || {};
-    const listCap = (st.config && st.config.dailyCap) || 0;
     statusBox.appendChild(
-      h('div', { class: 'auto-collect', text: `今日自动收录 ${collect.count || 0} / ${collect.cap || 0} 个岗位（用于补详情与 AI 匹配）` }),
-    );
-    statusBox.appendChild(
-      h('div', { class: 'auto-collect', text: `今日清单 ${counts.total || 0} / ${listCap || 0} 个（含已关闭 / 已投 / 已跳过）` }),
+      h('div', { class: 'auto-meta' }, [
+        h('span', { text: `清单日期 ${st.batch?.date || '—'}` }),
+        h('span', { text: `清单已用 ${counts.total || 0}/${listCap || 0}` }),
+        h('span', { text: '含已关闭 / 已投 / 已跳过' }),
+      ]),
     );
 
     if (run.state === 'running') {
@@ -1323,11 +1324,13 @@ function renderAutoApply() {
       h('div', { class: 'grid-2' }, [field('薪资下限', salary('salaryMinK', '如 15')), field('薪资上限', salary('salaryMaxK', '如 35'))]),
       field('HR 活跃要求', hrSel, { hint: '详情补齐后按 HR 最近活跃时间判断；越活跃越可能在招' }),
       h('div', { class: 'grid-2' }, [
-        ctlRow('每次滚动', '每次搜索向下滚动几次，越多收录越多，也越慢', numInput({ value: cfg.scrolls, min: 1, max: 10, unit: '次', onCommit: async (v) => { cfg.scrolls = v ?? 4; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.scrolls; } })),
-        ctlRow('匹配分门槛', '低于这个分数的岗位不进清单', numInput({ value: cfg.threshold, min: 0, max: 100, unit: '分', onCommit: async (v) => { cfg.threshold = v ?? 70; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.threshold; } })),
+        field('每次滚动', numInput({ value: cfg.scrolls, min: 1, max: 10, unit: '次', onCommit: async (v) => { cfg.scrolls = v ?? 4; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.scrolls; } }), { hint: '1–10 次；越多收录越多，也越慢' }),
+        field('匹配分门槛', numInput({ value: cfg.threshold, min: 0, max: 100, unit: '分', onCommit: async (v) => { cfg.threshold = v ?? 70; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.threshold; } }), { hint: '低于该分数不进清单' }),
       ]),
-      ctlRow('每日最多收录', '每天自动搜索最多新收录多少个岗位用于补详情和 AI 匹配；达到上限当天不再收录', numInput({ value: cfg.dailyCollectCap, min: 1, max: 300, unit: '个', onCommit: async (v) => { cfg.dailyCollectCap = v ?? 50; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCollectCap; } })),
-      ctlRow('每日清单上限', '每天最多纳入多少个岗位；已关闭 / 已投 / 已跳过的也占当天名额，第二天重新计算', numInput({ value: cfg.dailyCap, min: 1, max: 100, unit: '个', onCommit: async (v) => { cfg.dailyCap = v ?? 20; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCap; } })),
+      h('div', { class: 'grid-2' }, [
+        field('每日最多收录', numInput({ value: cfg.dailyCollectCap, min: 1, max: 300, unit: '个', onCommit: async (v) => { cfg.dailyCollectCap = v ?? 50; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCollectCap; } }), { hint: '达到上限当天不再收录' }),
+        field('每日清单上限', numInput({ value: cfg.dailyCap, min: 1, max: 100, unit: '个', onCommit: async (v) => { cfg.dailyCap = v ?? 20; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCap; } }), { hint: '关闭 / 已投也占当天名额' }),
+      ]),
       setRow('保留已沟通公司的其他岗位', '已沟通过的公司，其「未沟通」的岗位仍然纳入清单；已沟通过的岗位本身永远跳过', cfg.includeCompanyContacted, (v) => { cfg.includeCompanyContacted = v; saveNow(); refresh(); }),
     ]),
   );
