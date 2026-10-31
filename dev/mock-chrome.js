@@ -134,6 +134,14 @@
         setTimeout(() => broadcast({ type: 'APPLY_UPDATED' }), 0);
         return { started: true, total: ids.size };
       }
+      case 'APPLY_RETRY_FAILED': {
+        const ids = new Set(msg.uids || []);
+        const targets = (state.applyItems || []).filter((it) => it.status === 'failed' && (!ids.size || ids.has(it.uid)));
+        const targetIds = new Set(targets.map((it) => it.uid));
+        state.applyItems = (state.applyItems || []).map((it) => targetIds.has(it.uid) ? { ...it, status: 'pending', note: '' } : it);
+        setTimeout(() => broadcast({ type: 'APPLY_UPDATED' }), 0);
+        return { started: true, total: targets.length };
+      }
       case 'APPLY_STOP': return { stopping: true };
       case 'OPEN_SIDEPANEL': return { ok: true };
       case 'AI_PROVIDERS_GET': return state.providers;

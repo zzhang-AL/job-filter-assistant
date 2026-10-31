@@ -131,6 +131,8 @@ async function handle(msg, sender) {
       return markApplyItemStatus(msg.uids, msg.status);
     case MSG.APPLY_START:
       return startApplyRun(msg.uids);
+    case MSG.APPLY_RETRY_FAILED:
+      return retryFailedApply(msg.uids);
     case MSG.APPLY_STOP:
       return stopApplyRun();
     case MSG.WORKER_HALT_CLEAR:
@@ -1390,6 +1392,21 @@ async function markApplyItemStatus(uids, status) {
   broadcast(MSG.APPLY_UPDATED, {});
   await updateActionBadge();
   return autoApplyStatus();
+}
+
+// 一键重试失败项：把 failed 重新置为 pending 后直接开始，不需要用户重新勾选。
+// 不传 uids 时重试当天所有失败项；传 uids 时只重试其中仍为 failed 的项。
+async function retryFailedApply(uids) {
+  if (applyStarting || (applyRun && applyRun.state === 'running')) throw new Error('投递正在进行中');
+  const halt = await getHalt();
+  if (halt) throw new Error(`投递已暂停：${halt.reason}，请先在设置页解除暂停`);
+  const batch = await loadApplyBatch();
+  const wanted = new Set((Array.isArray(uids) ? uids : []).filter(Boolean));
+  const list = batch.items.filter((it) => it.status === 'failed' && (!wanted.size || wanted.has(it.uid)));
+  if (!list.length) throw new Error('没有可重试的失败岗位');
+  const targets = list.map((it) => it.uid);
+  await markApplyItems(targets, { status: 'pending', note: '', reviewedAt: new Date().toISOString() });
+  return startApplyRun(targets);
 }
 
 // 用户确认后开始逐个打开岗位页并点「立即沟通」。立即返回，进度通过广播 / 轮询给 UI。

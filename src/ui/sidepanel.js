@@ -1393,6 +1393,7 @@ function renderApplyStatusBar() {
       compact: true,
       title: run.state === 'error' ? '上次投递中断' : run.state === 'stopped' ? '上次投递已停止' : '上次投递完成',
       desc: `完成 ${done + failed}/${run.total} · 成功 ${done} · 失败 ${failed}${run.error ? ` · ${run.error}` : ''}`,
+      actions: failed ? [{ label: `重试失败 ${failed} 个`, primary: true, onClick: () => retryFailedUi() }] : [],
     }));
   }
   return box;
@@ -1562,22 +1563,32 @@ function fillApplyBottom(bar) {
         h('button', { class: 'btn btn-sm btn-ghost danger-text', text: '关闭所选', onclick: closeApplySelected }),
         iconBtn('more', '更多', (e) =>
           openMenu(e.currentTarget, [
+            items.some((it) => it.status === 'failed')
+              ? { icon: 'refresh', label: '重试失败岗位', hint: '不需要重新勾选，直接重跑失败项', onClick: () => retryFailedUi() }
+              : null,
             { icon: 'refresh', label: '刷新清单', hint: '把新匹配的岗位补进来', onClick: refreshApplyUi },
             { icon: 'gear', label: '自动投递设置', hint: '搜索条件、时间和每日上限', onClick: () => send(MSG.OPEN_OPTIONS, { section: 'autoapply' }) },
-          ]),
+          ].filter(Boolean)),
         ),
       ]),
     );
     return;
   }
+  const failed = items.filter((it) => it.status === 'failed').length;
   bar.appendChild(
     h('button', {
-      class: 'btn btn-sm ' + (pending.length ? 'btn-primary' : 'btn-ghost'),
+      class: 'btn btn-sm ' + (pending.length ? 'btn-primary' : failed ? 'btn-ghost' : 'btn-ghost'),
       disabled: !pending.length,
       title: '先全选待确认岗位，再点「确认投递」',
       onclick: selectAllApply,
     }, [icon('check'), pending.length ? `全选待确认（${pending.length}）` : '没有待确认岗位']),
   );
+  if (failed) {
+    bar.appendChild(h('button', {
+      class: 'btn btn-sm ' + (pending.length ? 'btn-tonal' : 'btn-primary'),
+      onclick: () => retryFailedUi(),
+    }, [icon('refresh'), `重试失败 ${failed}`]));
+  }
   bar.appendChild(h('div', { class: 'spacer' }));
   bar.appendChild(h('button', { class: 'btn btn-sm btn-ghost', onclick: refreshApplyUi }, [icon('refresh'), '刷新清单']));
 }
@@ -1653,15 +1664,19 @@ async function rejectApplyItem(it) {
   }
 }
 
-async function retryApplyItem(it) {
+async function retryFailedUi(uids = []) {
   try {
-    await send(MSG.APPLY_ITEM_MARK, { uids: [it.uid], status: 'pending' });
-    applyChecked.add(it.uid);
+    const r = await send(MSG.APPLY_RETRY_FAILED, { uids });
+    toast(r && r.started ? `开始重试 ${r.total || uids.length || ''} 个岗位` : '已开始重试');
     await refreshApplyStatus();
     render();
   } catch (e) {
     toast(e.message, true);
   }
+}
+
+async function retryApplyItem(it) {
+  await retryFailedUi([it.uid]);
 }
 
 async function stopApplyUi() {

@@ -124,6 +124,7 @@ export const MSG = {
   APPLY_REFRESH: 'APPLY_REFRESH', // UI -> bg：按当前岗位库重新生成（只追加，不覆盖已确认状态）
   APPLY_ITEM_MARK: 'APPLY_ITEM_MARK', // UI -> bg：确认 / 忽略清单条目
   APPLY_START: 'APPLY_START', // UI -> bg：用户确认后开始逐个点「立即沟通」
+  APPLY_RETRY_FAILED: 'APPLY_RETRY_FAILED', // UI -> bg：一键把失败项重新排队并投递
   APPLY_STOP: 'APPLY_STOP',
   APPLY_UPDATED: 'APPLY_UPDATED', // bg -> UI：清单或投递进度变化
   APPLY_CLICK: 'APPLY_CLICK', // bg -> content：在岗位页点「立即沟通」（不自动发送消息）
