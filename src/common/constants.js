@@ -128,6 +128,7 @@ export const MSG = {
   APPLY_STOP: 'APPLY_STOP',
   APPLY_UPDATED: 'APPLY_UPDATED', // bg -> UI：清单或投递进度变化
   APPLY_CLICK: 'APPLY_CLICK', // bg -> content：在岗位页点「立即沟通」（不自动发送消息）
+  CHAT_STATE: 'CHAT_STATE', // bg -> content：读取当前页面是否已出现聊天输入框 / 是否被限制
 
   // 面板控制
   OPEN_OPTIONS: 'OPEN_OPTIONS',

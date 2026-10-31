@@ -1501,6 +1501,10 @@ async function runApplyQueue(items) {
       }
       broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
       persistApplyRun();
+      if (res.limited) {
+        applyRun.error = res.error || 'BOSS 提示沟通次数已达上限，已停止投递';
+        break;
+      }
       if (res.blocked) {
         applyRun.error = res.error || 'BOSS 触发安全验证，已停止投递';
         break;
@@ -1599,12 +1603,13 @@ async function applyOne(item, cfg) {
 
     let confirmed = res.mode === 'chat';
     if (res.mode === 'clicked') {
-      const nav = await waitForChatTab(tab.id, 8000, job);
+      const nav = await waitForChatTab(tab.id, 12000, job);
       if (nav.blocked) {
         const why = nav.blocked === 'login' ? 'BOSS 未登录，自动投递已暂停' : 'BOSS 触发安全验证，自动投递暂停 30 分钟';
         await setHalt(why, nav.blocked === 'login' ? 10 * 60 * 1000 : 30 * 60 * 1000, nav.blocked);
         return { ok: false, blocked: true, error: why };
       }
+      if (nav.limited) return { ok: false, limited: true, error: nav.error || 'BOSS 提示沟通次数已达上限，已停止投递' };
       if (nav.unconfirmed) {
         // 已经点击并进入聊天页，只是无法确认会话身份。不要让它打断整批投递：
         // 记为已沟通并附上提示，队列继续；用户可在聊天页自行核对。
@@ -1614,7 +1619,7 @@ async function applyOne(item, cfg) {
       confirmed = nav.ok;
       chatTabId = nav.newTabId || 0;
       if (chatTabId) applyTabs.add(chatTabId);
-      if (!confirmed) return { ok: false, error: '已点击「立即沟通」，但没有进入沟通页（可能被拦截或按钮失效）' };
+      if (!confirmed) return { ok: false, error: `已点击「立即沟通」，但没有进入沟通页（可能被拦截或按钮失效）${nav.title ? `（页面：${nav.title}）` : ''}` };
     }
     if (!confirmed) return { ok: false, error: '未确认进入沟通页' };
 
@@ -1635,6 +1640,15 @@ async function applyOne(item, cfg) {
 
 // 点「立即沟通」后 BOSS 会整页跳到聊天页；轮询标签页 URL 确认，顺便识别登录 / 验证页。
 // 少数情况下 BOSS 会新开标签页，这时用 openerTabId 认领新标签，避免误判成失败再点一次。
+async function getChatState(tabId) {
+  try {
+    const r = await sendMessageWithRetry(tabId, { type: MSG.CHAT_STATE }, 2, 400);
+    return r && r.ok ? r : null;
+  } catch {
+    return null;
+  }
+}
+
 async function verifyChatSession(tabId, job) {
   try {
     const r = await sendMessageWithRetry(tabId, {
@@ -1654,6 +1668,8 @@ async function waitForChatTab(tabId, timeoutMs, job) {
     let deadlineTimer = null;
     let newTabId = 0; // BOSS 少数情况下会新开聊天天标签页
     let verifying = false;
+    let checkingState = false;
+    let lastState = null;
     const cleanups = [];
     const finish = (result) => {
       if (done) return;
@@ -1697,8 +1713,22 @@ async function waitForChatTab(tabId, timeoutMs, job) {
         return;
       }
       try {
-        if (/^\/web\/user\/?$/.test(new URL(url).pathname)) finish({ ok: false, blocked: 'login' });
+        if (/^\/web\/user\/?$/.test(new URL(url).pathname)) { finish({ ok: false, blocked: 'login' }); return; }
       } catch {}
+      // 兼容点击后不跳 URL、只在当前页打开聊天抽屉的版本：直接问页面有没有聊天输入框
+      if (checkingState || done) return;
+      checkingState = true;
+      const state = await getChatState(id);
+      checkingState = false;
+      if (done || !state) return;
+      lastState = state;
+      if (state.blocked) { finish({ ok: false, blocked: state.blocked, title: state.title }); return; }
+      if (state.limited) {
+        finish({ ok: false, limited: true, error: 'BOSS 提示沟通次数已达上限，已停止投递', title: state.title });
+        return;
+      }
+      if (state.chat) { finish({ ok: true, ...(id !== tabId ? { newTabId: id } : {}) }); return; }
+      if (/继续沟通/.test(state.label || '')) { finish({ ok: true, already: true, ...(id !== tabId ? { newTabId: id } : {}) }); return; }
     };
     // 用 onUpdated 替代每 400ms 查询所有标签页；轮询只针对当前一个 tab，开销小得多
     const onUpdated = (id) => {
@@ -1725,8 +1755,13 @@ async function waitForChatTab(tabId, timeoutMs, job) {
     pollTimer = setInterval(() => {
       checkTab(tabId);
       if (newTabId) checkTab(newTabId);
-    }, 1200);
-    deadlineTimer = setTimeout(() => finish({ ok: false, timeout: true }), timeoutMs);
+    }, 1000);
+    deadlineTimer = setTimeout(() => finish({
+      ok: false,
+      timeout: true,
+      title: lastState && lastState.title,
+      text: lastState && lastState.text,
+    }), timeoutMs);
     checkTab(tabId);
   });
 }

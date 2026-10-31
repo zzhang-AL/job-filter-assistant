@@ -15,6 +15,7 @@
     WORKER_HALT_CLEAR: 'WORKER_HALT_CLEAR',
     APPLY_CLICK: 'APPLY_CLICK',
     CHAT_VERIFY: 'CHAT_VERIFY',
+    CHAT_STATE: 'CHAT_STATE',
   };
 
   // 判断嗅探到的 URL 是「列表」还是「岗位详情/卡片」
@@ -581,6 +582,24 @@
     return true;
   });
 
+  // 读取当前页面聊天状态：兼容点击「立即沟通」后不跳 URL、只在当前页打开聊天抽屉的版本
+  function readChatState() {
+    const body = String((document.body && document.body.innerText) || '');
+    const input = findChatInput();
+    const start = findStartChatButton();
+    const blocked = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
+    const limited = /沟通次数|打招呼次数|今日.{0,6}(上限|次数)|操作过于频繁|请稍后再试/.test(body);
+    return {
+      ok: true,
+      chat: !!input,
+      label: start ? String(start.textContent || '').trim() : '',
+      blocked,
+      limited,
+      title: String(document.title || ''),
+      text: body.replace(/\s+/g, ' ').slice(0, 200),
+    };
+  }
+
   // 聊天页确认：不能只看 URL 是不是 /web/geek/chat（裸聊天列表也满足），
   // 尽量用 URL 的 jobId 或页面里的公司名确认是不是目标会话。
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -600,6 +619,16 @@
       }
       const text = String(scope.innerText || '').slice(0, 8000).toLowerCase();
       sendResponse({ ok: true, matched: idMatch || text.includes(company), jobId: urlJobId });
+    } catch (e) {
+      sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+    return false;
+  });
+
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || msg.type !== MSG.CHAT_STATE) return false;
+    try {
+      sendResponse(readChatState());
     } catch (e) {
       sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
     }
