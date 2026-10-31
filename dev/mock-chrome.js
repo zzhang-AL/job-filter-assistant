@@ -60,7 +60,7 @@
       salaryText: j.salaryText, city: j.city, district: j.district, experience: j.experience, degree: j.degree,
       hrActiveText: j.hrActiveText, url: j.url, score: j.match.score, verdict: j.match.verdict,
       summary: j.match.summary, hasGreeting: !!(j.match.greetings && j.match.greetings.standard),
-      greetingPreview: '', companyContacted: false, status: 'pending',
+      greetingPreview: '', companyContacted: j.contacted === 'company', status: 'pending',
       addedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     }));
 
@@ -71,7 +71,7 @@
     return {
       enabled: state.settings.autoApply.enabled,
       config: state.settings.autoApply,
-      collect: { date: '2026-10-31', count: 12, cap: 50 },
+      collect: { date: '2026-10-31', count: Math.min(12, state.settings.autoApply.dailyCollectCap), cap: state.settings.autoApply.dailyCollectCap },
       search: { running: false, lastSearchDate: '2026-10-31', lastSearchAt: Date.now() - 3600000, lastSearchStatus: 'ok', lastSearchError: '', lastSearchCount: 3, nextRunAt: Date.now() + 6 * 3600000 },
       batch: { date: '2026-10-31', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), items, counts },
       run: { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false },

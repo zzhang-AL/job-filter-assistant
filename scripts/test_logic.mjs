@@ -974,6 +974,7 @@ test('投递资格：已沟通岗位排除；已沟通公司的未沟通岗位�
   assert.equal(eligibleForApply(APPLY_JOB('boss:a5', { match: { score: 60 } }), cfg), false, '低于门槛');
   assert.equal(eligibleForApply(APPLY_JOB('boss:a6', { platform: 'qcwy' }), cfg), false, '只投 BOSS');
   assert.equal(eligibleForApply(APPLY_JOB('boss:a7', { dismissedAt: 't' }), cfg), false);
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a8', { match: { score: 95, eligible: false } }), cfg), false, 'AI 判定硬门槛不满足的岗位即使分高也不能投');
 });
 
 test('候选清单：分数排序、每日上限、同公司同名去重、历史已投排除', () => {

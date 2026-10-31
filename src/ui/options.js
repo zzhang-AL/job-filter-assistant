@@ -222,7 +222,14 @@ function numInput({ value, min, max, unit, width = 76, onCommit }) {
   const input = h('input', { type: 'number', min, max, value: value ?? '', style: `width:${width}px` });
   input.addEventListener('change', async () => {
     const shown = await onCommit(input.value === '' ? null : Number(input.value));
-    if (shown !== undefined && document.activeElement !== input) input.value = shown ?? '';
+    if (shown !== undefined) {
+      // 越界值会被后台收敛（如 500 → 100）；无论是否失焦都回写，避免界面显示的值和实际保存值不一致
+      if (String(shown ?? '') !== input.value) {
+        input.classList.add('invalid');
+        setTimeout(() => input.classList.remove('invalid'), 1200);
+      }
+      input.value = shown ?? '';
+    }
   });
   return unit ? h('span', { class: 'num-wrap' }, [input, h('span', { class: 'num-unit', text: unit })]) : input;
 }
@@ -763,6 +770,11 @@ function renderProviderCard(prov, isActive) {
       await saveProviders(providers);
       toast(`已选择模型 ${prov.model}`);
     });
+    // 手动改模型 ID 时同步下拉，避免两个控件显示不同模型
+    modelInput.addEventListener('input', () => {
+      const v = modelInput.value.trim();
+      modelSelect.value = prov.discoveredModels.includes(v) ? v : '';
+    });
   }
 
   const keyInput = bind('apiKey', { type: 'password', ph: 'sk-...' });
@@ -1168,8 +1180,12 @@ function renderAutoApply() {
     ]);
     statusBox.appendChild(stat);
     const collect = st.collect || {};
+    const listCap = (st.config && st.config.dailyCap) || 0;
     statusBox.appendChild(
       h('div', { class: 'auto-collect', text: `今日自动收录 ${collect.count || 0} / ${collect.cap || 0} 个岗位（用于补详情与 AI 匹配）` }),
+    );
+    statusBox.appendChild(
+      h('div', { class: 'auto-collect', text: `今日清单 ${counts.total || 0} / ${listCap || 0} 个（含已关闭 / 已投 / 已跳过）` }),
     );
 
     if (run.state === 'running') {
@@ -1310,8 +1326,8 @@ function renderAutoApply() {
         ctlRow('每次滚动', '每次搜索向下滚动几次，越多收录越多，也越慢', numInput({ value: cfg.scrolls, min: 1, max: 10, unit: '次', onCommit: async (v) => { cfg.scrolls = v ?? 4; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.scrolls; } })),
         ctlRow('匹配分门槛', '低于这个分数的岗位不进清单', numInput({ value: cfg.threshold, min: 0, max: 100, unit: '分', onCommit: async (v) => { cfg.threshold = v ?? 70; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.threshold; } })),
       ]),
-      ctlRow('每日最多收录', '每天自动搜索最多新收录多少个岗位用于补详情和 AI 匹配；达到上限当天不再收录', numInput({ value: cfg.dailyCollectCap, min: 1, max: 300, unit: '个', onCommit: async (v) => { cfg.dailyCollectCap = v ?? 50; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.dailyCollectCap; } })),
-      ctlRow('每日清单上限', '每天最多纳入多少个岗位；已关闭 / 已投 / 已跳过的也占当天名额，第二天重新计算', numInput({ value: cfg.dailyCap, min: 1, max: 100, unit: '个', onCommit: async (v) => { cfg.dailyCap = v ?? 20; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.dailyCap; } })),
+      ctlRow('每日最多收录', '每天自动搜索最多新收录多少个岗位用于补详情和 AI 匹配；达到上限当天不再收录', numInput({ value: cfg.dailyCollectCap, min: 1, max: 300, unit: '个', onCommit: async (v) => { cfg.dailyCollectCap = v ?? 50; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCollectCap; } })),
+      ctlRow('每日清单上限', '每天最多纳入多少个岗位；已关闭 / 已投 / 已跳过的也占当天名额，第二天重新计算', numInput({ value: cfg.dailyCap, min: 1, max: 100, unit: '个', onCommit: async (v) => { cfg.dailyCap = v ?? 20; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCap; } })),
       setRow('保留已沟通公司的其他岗位', '已沟通过的公司，其「未沟通」的岗位仍然纳入清单；已沟通过的岗位本身永远跳过', cfg.includeCompanyContacted, (v) => { cfg.includeCompanyContacted = v; saveNow(); refresh(); }),
     ]),
   );

@@ -294,6 +294,8 @@ export function eligibleForApply(job, cfg, { history = {}, strictFilters = true 
   if (history[job.uid]) return false;
   if (!detailReady(job)) return false;
   if (!job.match || !Number.isFinite(Number(job.match.score))) return false;
+  // 硬门槛（经验 / 学历 / 硬性排除）由 AI 标成 eligible=false：即使分数门槛调得很低也不能投
+  if (job.match.eligible === false) return false;
   if (Number(job.match.score) < cfg.threshold) return false;
   if (!job.url || !/^https:\/\/www\.zhipin\.com\/job_detail\//.test(job.url)) return false;
   return matchSearchFilter(job, cfg, { strict: strictFilters }).keep;

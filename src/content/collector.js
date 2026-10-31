@@ -14,6 +14,7 @@
     DETAIL_PROGRESS: 'DETAIL_PROGRESS',
     WORKER_HALT_CLEAR: 'WORKER_HALT_CLEAR',
     APPLY_CLICK: 'APPLY_CLICK',
+    CHAT_VERIFY: 'CHAT_VERIFY',
   };
 
   // 判断嗅探到的 URL 是「列表」还是「岗位详情/卡片」
@@ -106,6 +107,9 @@
     flashBadge();
     scheduleReapplyFresh(); // 新一批卡片渲染后，若排序开着则重排
   });
+
+  // 告诉 MAIN world 的 sniffer：监听器已就绪，可以把启动阶段缓存的 joblist 响应补发过来
+  try { window.postMessage({ source: 'job-helper:sniffer-ready' }, location.origin); } catch {}
 
   // —— 识别当前详情页岗位标识 & 是否聊天页 ——
   function detectJobKey() {
@@ -422,7 +426,11 @@
       lastCaptured = captured;
       if (stalls >= 2) break; // 连续两次滚动都没有新数据：到底了
     }
-    await sleep(1200); // 等最后一个 joblist 响应落地，再让后台关标签页
+    await sleep(2500); // 等最后一个 joblist 响应落地（sniffer 解析 + postMessage 有延迟）
+    if (captured === 0 && countJobCards() > 0) {
+      // 页面有岗位卡片却完全没嗅探到列表接口：多半是注入/结构变化，报失败让后台当天重试
+      return { ok: false, error: '未捕获岗位列表接口（页面结构可能变化）' };
+    }
     return { ok: true, count: lastCards };
   }
 
@@ -519,8 +527,9 @@
     if (expectedJobId && jobKey !== String(expectedJobId)) {
       return { ok: false, error: '当前页面岗位与清单不一致（可能已下架或跳转），已跳过' };
     }
-    // 已经在聊天页：上一次点击已经进来了，或用户自己打开了聊天
-    if (detectChat()) {
+    // 已经在聊天页：上一次点击已经进来了，或用户自己打开了聊天。
+    // 必须 URL 也真的是聊天页，避免详情页上残留的聊天 DOM 让点击被短路。
+    if (/\/web\/geek\/chat/.test(location.pathname) && detectChat()) {
       const input = await waitFor(findChatInput, 8000);
       return input ? { ok: true, mode: 'chat' } : { ok: false, error: '聊天页输入框未出现' };
     }
@@ -561,6 +570,31 @@
       }
     })();
     return true;
+  });
+
+  // 聊天页确认：不能只看 URL 是不是 /web/geek/chat（裸聊天列表也满足），
+  // 尽量用 URL 的 jobId 或页面里的公司名确认是不是目标会话。
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || msg.type !== MSG.CHAT_VERIFY) return false;
+    try {
+      const m = location.href.match(/[?&#](?:jobId|id|encryptJobId)=([\w~-]+)/);
+      const urlJobId = m ? m[1] : '';
+      const idMatch = !!(msg.jobId && urlJobId && urlJobId === String(msg.jobId));
+      const company = String(msg.company || '').trim().toLowerCase();
+      // 只查当前会话头部 / 选中的会话项，别用整个 body（左侧会话列表里可能正好有同公司，造成误判）
+      const scope = document.querySelector(
+        '.chat-header, .chat-title, .conversation-detail, .chat-conversation, .chat-content, .chat-panel, .conversation-header, .user-list li.active, .user-list li.on, .user-list li.selected',
+      );
+      if (!scope || !company) {
+        sendResponse({ ok: true, matched: idMatch ? true : null, jobId: urlJobId });
+        return false;
+      }
+      const text = String(scope.innerText || '').slice(0, 8000).toLowerCase();
+      sendResponse({ ok: true, matched: idMatch || text.includes(company), jobId: urlJobId });
+    } catch (e) {
+      sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+    return false;
   });
 
   function isVisible(el) {

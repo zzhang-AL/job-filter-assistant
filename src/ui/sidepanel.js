@@ -361,7 +361,8 @@ const saveListScroll = debounce(() => {
     localStorage.setItem(LIST_SCROLL_KEY, JSON.stringify(listScroll));
   } catch {}
 }, 300);
-const listScrollKey = () => [view.platform, view.verdict, view.sort, view.search.trim()].join('|');
+// 滚动位置按 tab 分开记：投递清单和岗位库共用 '.sp-list'，不能互相套用偏移
+const listScrollKey = () => [view.tab, view.platform, view.verdict, view.sort, view.search.trim()].join('|');
 
 function render() {
   // 菜单开着时先不重绘（后台广播很密，会把菜单连同锚点一起冲掉），关掉菜单后补上
@@ -1397,11 +1398,16 @@ function fillApplyList(listEl) {
     const cfg = (applyStatus && applyStatus.config) || {};
     const counts = (applyStatus && applyStatus.batch && applyStatus.batch.counts) || {};
     if (all.length) {
+      const parts = [];
+      if (counts.applied) parts.push(`已沟通 ${counts.applied} 个`);
+      if (counts.rejected) parts.push(`已关闭 ${counts.rejected} 个`);
+      if (counts.skipped) parts.push(`已跳过 ${counts.skipped} 个`);
+      if (!parts.length) parts.push(`共 ${all.length} 个岗位`);
       listEl.appendChild(
         emptyState(
           'check',
           '今天的投递清单已处理完',
-          `已关闭 ${counts.rejected || 0} 个岗位；明天会重新生成清单，也可以在设置里调高每日清单上限。`,
+          `${parts.join('、')}；明天会重新生成清单，也可以在设置里调高每日清单上限。`,
           { label: '刷新清单', onClick: refreshApplyUi },
         ),
       );
@@ -1599,12 +1605,13 @@ async function confirmApply() {
 async function closeApplySelected() {
   const uids = [...applyChecked].filter(Boolean);
   if (!uids.length) return;
+  if (!confirm(`关闭选中的 ${uids.length} 个岗位？\n\n关闭后会标为「不感兴趣」，以后不再推荐（可在岗位库恢复）；今天清单名额不会返还。`)) return;
   try {
     await send(MSG.APPLY_ITEM_MARK, { uids, status: 'rejected' });
     applyChecked.clear();
     await refreshApplyStatus();
     render();
-    toast(`已关闭 ${uids.length} 个岗位，以后不再推荐`);
+    toast(`已关闭 ${uids.length} 个岗位，可在岗位库恢复`);
   } catch (e) {
     toast(e.message, true);
   }
@@ -1616,7 +1623,7 @@ async function rejectApplyItem(it) {
     applyChecked.delete(it.uid);
     await refreshApplyStatus();
     render();
-    toast(`已关闭「${it.title || '该岗位'}」，以后不再推荐`);
+    toast(`已关闭「${it.title || '该岗位'}」，可在岗位库恢复`);
   } catch (e) {
     toast(e.message, true);
   }
