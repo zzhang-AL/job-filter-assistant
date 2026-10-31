@@ -114,7 +114,7 @@ export function isDetailReady(j) {
 // 从给定岗位里挑出需要补抓详情的（无 JD，或详情已超过 staleMs 未刷新——HR 活跃时间会过期）。
 // 只处理有独立详情页的 BOSS 岗位；沟通过的这个岗位不再补（同公司的其他岗位默认也不补，
 // 但每日自动搜索允许通过 allowCompanyContacted 保留「已沟通公司的未沟通岗位」）。
-export function pickJobsNeedingDetail(list, uids, { staleMs = 24 * 3600 * 1000, allowCompanyContacted = false } = {}) {
+export function pickJobsNeedingDetail(list, uids, { staleMs = 24 * 3600 * 1000, allowCompanyContacted = true } = {}) {
   const want = new Set(uids);
   const now = Date.now();
   return list

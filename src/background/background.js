@@ -830,14 +830,11 @@ async function markViewedOnPage(platform, jobKey) {
 }
 
 function autoCandidates(jobs, settings) {
-  // 只有开启自动投递（或正在手动跑每日搜索）时才需要分析「已沟通公司的其他岗位」
-  const allowCompany = !!(settings.autoApply && settings.autoApply.includeCompanyContacted && (settings.autoApply.enabled || searchRunning || Date.now() < dailyActiveUntil));
   return jobs.filter(
     (j) =>
       isDetailReady(j) &&
       !j.match &&
-      j.contacted !== 'job' && // 已沟通这个岗位：不再分析
-      (allowCompany || j.contacted !== 'company') && // 已沟通公司的其他岗位按设置保留
+      j.contacted !== 'job' && // 只跳过沟通过的这个岗位，同公司的其他岗位照常分析
       !j.dismissedAt && // 标了不感兴趣的不花 AI 调用；恢复后会重新进入候选
       (j.autoScoreFails || 0) < AUTO_MAX_FAILS &&
       !inActiveBatch(j.uid) && // 正在批量分析里的交给批量，避免同一岗位分析两次
@@ -1011,7 +1008,6 @@ let searchSeen = 0;
 let searchCapped = false;
 let collectReserveChain = Promise.resolve();
 let captureChain = Promise.resolve();
-let dailyActiveUntil = 0; // 手动跑每日搜索后的一段时间内，已沟通公司的岗位也要参与匹配
 let refreshRunning = false;
 let refreshQueued = false;
 let refreshQueuedForce = false;
@@ -1295,7 +1291,6 @@ async function triggerDailySearch(trigger = 'manual') {
     throw e;
   }
   if (trigger !== 'retry') await saveAutoApplyState({ searchRetryAt: 0, searchRetryCount: 0 });
-  dailyActiveUntil = Date.now() + 6 * 3600 * 1000;
   searchCaptured = 0;
   searchSeen = 0;
   searchCapped = false;

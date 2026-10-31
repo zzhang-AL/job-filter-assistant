@@ -235,11 +235,15 @@ test('每日自动搜索：已沟通公司的未沟通岗位允许补详情，�
     { uid: 'boss:h1', jobId: 'h1', platform: 'boss', url: u('h1'), contacted: 'company', raw: {} },
     { uid: 'boss:h2', jobId: 'h2', platform: 'boss', url: u('h2'), contacted: 'job', raw: {} },
   ];
-  assert.deepEqual(pickJobsNeedingDetail(lib, ['boss:h1', 'boss:h2']).map((x) => x.uid), [], '普通流程仍跳过已沟通公司');
   assert.deepEqual(
-    pickJobsNeedingDetail(lib, ['boss:h1', 'boss:h2'], { allowCompanyContacted: true }).map((x) => x.uid),
+    pickJobsNeedingDetail(lib, ['boss:h1', 'boss:h2']).map((x) => x.uid),
     ['boss:h1'],
-    '每日搜索保留同公司的未沟通岗位，但已沟通岗位仍排除',
+    '普通流程保留同公司的未沟通岗位，已沟通岗位排除',
+  );
+  assert.deepEqual(
+    pickJobsNeedingDetail(lib, ['boss:h1', 'boss:h2'], { allowCompanyContacted: false }).map((x) => x.uid),
+    [],
+    '关闭同公司岗位时连详情也不补',
   );
 });
 test('详情页地址只认 BOSS job_detail', () => {
