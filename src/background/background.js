@@ -12,7 +12,7 @@ import {
 import { insertDetailTask, taskTier, randInt } from '../common/pacing.js';
 import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt, setHalt, setCapBypass } from './tabWorker.js';
 import {
-  buildBossSearchUrl, dailyDue, dateKey, nextRunAt, matchSearchFilter, pickApplyCandidates, mergeApplyBatch, countApply,
+  buildBossSearchUrl, dailyDue, dateKey, nextRunAt, matchSearchFilter, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
 } from '../common/autoApply.js';
 import {
   loadApplyBatch, updateApplyBatch, loadApplyHistory, addApplyHistory, loadAutoApplyState, saveAutoApplyState, markApplyItems,
@@ -263,6 +263,25 @@ async function onJobsCaptured(msg, sender) {
     jobs = jobs.filter((j) => matchSearchFilter(j, autoCfg).keep);
     searchSeen += rawCount; // 用过滤前的数量判断「有没有搜到」，避免条件过严被误报成没搜到
     if (!jobs.length) return { added: 0, updated: 0, filtered: true };
+    // 每天自动收录数量上限：只给「库里还没有的新岗位」占名额；
+    // 重复出现的岗位仍更新列表字段（HR 在线 / 活跃），但不消耗当天额度。
+    const existingUids = new Set((await loadJobs()).map((j) => j.uid));
+    const fresh = [];
+    const freshSeen = new Set(existingUids);
+    for (const j of jobs) {
+      if (!j.uid || freshSeen.has(j.uid)) continue;
+      freshSeen.add(j.uid);
+      fresh.push(j);
+    }
+    const slots = await reserveCollectSlots(fresh.length, autoCfg);
+    if (slots < fresh.length) searchCapped = true;
+    if (fresh.length && !slots) {
+      jobs = jobs.filter((j) => existingUids.has(j.uid));
+      if (!jobs.length) return { added: 0, updated: 0, capped: true };
+    } else if (fresh.length) {
+      const allowed = new Set(fresh.slice(0, slots).map((j) => j.uid));
+      jobs = jobs.filter((j) => existingUids.has(j.uid) || allowed.has(j.uid));
+    }
   }
 
   // 屏蔽名单：永远不收录；已沟通：不新增（库里已有的照常更新并打标）
@@ -944,6 +963,8 @@ const SEARCH_TIMEOUT_MS = 150000;
 let searchRunning = false;
 let searchCaptured = 0;
 let searchSeen = 0;
+let searchCapped = false;
+let collectReserveChain = Promise.resolve();
 let refreshRunning = false;
 let refreshQueued = false;
 let refreshQueuedForce = false;
@@ -954,6 +975,23 @@ function publicApplyRun() {
   return applyRun
     ? { ...applyRun }
     : { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false };
+}
+
+// 预留当天的「自动收录」名额。多个 joblist 响应可能几乎同时到达，用一条 Promise 链串行化，
+// 避免两个响应同时读到旧计数、一起突破上限。
+function reserveCollectSlots(n, cfg) {
+  const run = collectReserveChain.then(async () => {
+    const st = await loadAutoApplyState();
+    const take = Math.min(Math.max(0, Number(n) || 0), collectQuota(cfg, st));
+    if (take > 0) {
+      const today = dateKey();
+      const used = st.collectDate === today ? Math.max(0, Number(st.collected) || 0) : 0;
+      await saveAutoApplyState({ collectDate: today, collected: used + take });
+    }
+    return take;
+  });
+  collectReserveChain = run.catch(() => {});
+  return run;
 }
 
 async function autoApplyStatus() {
@@ -967,9 +1005,15 @@ async function autoApplyStatus() {
       keywords: cfg.keywords,
       cityName: cfg.cityName,
       threshold: cfg.threshold,
+      dailyCollectCap: cfg.dailyCollectCap,
       dailyCap: cfg.dailyCap,
       includeCompanyContacted: cfg.includeCompanyContacted,
       applyForeground: cfg.applyForeground,
+    },
+    collect: {
+      date: state.collectDate || '',
+      count: state.collectDate === dateKey() ? Math.max(0, Number(state.collected) || 0) : 0,
+      cap: cfg.dailyCollectCap,
     },
     search: {
       running: searchRunning,
@@ -991,7 +1035,7 @@ async function autoApplyStatus() {
   };
 }
 
-// 重新生成清单：只追加新候选，保留用户已确认 / 已忽略 / 已投递的状态。
+// 重新生成清单：只追加新候选，保留用户已确认 / 已关闭 / 已投递的状态。
 // 同时把已经不成立的条目（岗位被删、已在别处沟通、标了不感兴趣）标成跳过。
 async function refreshApplyList({ notify = false, force = false } = {}) {
   if (refreshRunning) {
@@ -1011,7 +1055,9 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
     const cur = await loadApplyBatch();
     // 投递跨过午夜时不要滚动到新清单：否则后台标记结果找不到旧条目，当天状态会丢
     const dayKey = applyRun && applyRun.state === 'running' && cur.date ? cur.date : dateKey();
-    const cands = pickApplyCandidates(jobs, cfg, { existing: cur.items, history });
+    // 只有和当前清单同一天时才把已有条目算进每日名额；跨天时旧清单不计入新一天
+    const existingForPick = cur.date && cur.date === dayKey ? cur.items : [];
+    const cands = pickApplyCandidates(jobs, cfg, { existing: existingForPick, history });
     let added = 0;
     const next = await updateApplyBatch((batch) => {
       const merged = mergeApplyBatch(batch, cands, { dateKey: dayKey });
@@ -1153,6 +1199,7 @@ async function triggerDailySearch(trigger = 'manual') {
   }
   searchCaptured = 0;
   searchSeen = 0;
+  searchCapped = false;
   broadcast(MSG.APPLY_UPDATED, { searchStarted: true, trigger });
   updateActionBadge();
   runDailySearchNow(cfg)
@@ -1204,8 +1251,14 @@ async function runDailySearchNow(cfg) {
     // 只在还没跑过时保持空日期，熔断解除后下一轮 tick 自动重试
     lastSearchDate: halted ? (await loadAutoApplyState()).lastSearchDate || '' : dateKey(),
     lastSearchAt: Date.now(),
-    lastSearchStatus: errors.length ? 'error' : empty ? 'empty' : 'ok',
-    lastSearchError: errors.length ? errors.join('；') : empty ? '没有搜到新岗位（可能都已收录 / 已沟通，或筛选条件过严）' : '',
+    lastSearchStatus: errors.length ? 'error' : empty ? 'empty' : searchCapped ? 'capped' : 'ok',
+    lastSearchError: errors.length
+      ? errors.join('；')
+      : empty
+        ? '没有搜到新岗位（可能都已收录 / 已沟通，或筛选条件过严）'
+        : searchCapped
+          ? '今日自动收录已达上限，剩余岗位明天再收；可在设置里调高「每日最多收录」'
+          : '',
     lastSearchCount: searchCaptured,
   });
   await refreshApplyList({ notify: true, force: true });

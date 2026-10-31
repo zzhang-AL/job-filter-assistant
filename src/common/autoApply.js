@@ -66,7 +66,7 @@ export const HR_ACTIVE_OPTIONS = [
 export const APPLY_STATUS_LABELS = {
   applying: '投递中',
   pending: '待确认',
-  rejected: '已忽略',
+  rejected: '已关闭',
   applied: '已沟通',
   failed: '失败',
   skipped: '已跳过',
@@ -85,7 +85,8 @@ export function defaultAutoApply() {
     salaryMaxK: null,
     hrActiveMaxTier: 3, // 默认只要「本月活跃」及以上
     threshold: 70, // 匹配分门槛
-    dailyCap: 20, // 每日清单最多保留多少个（不含已忽略）
+    dailyCollectCap: 50, // 每天自动搜索最多新收录多少个岗位（用于补详情 + AI 匹配）
+    dailyCap: 20, // 每天最多纳入投递清单多少个（关闭的也占当天名额）
     includeCompanyContacted: true, // 已沟通公司的其他未沟通岗位也纳入
     applyForeground: true, // 点「立即沟通」时前台打开页面
     applyGapMinSec: 5,
@@ -132,6 +133,7 @@ export function sanitizeAutoApply(input) {
     salaryMaxK,
     hrActiveMaxTier: num(o.hrActiveMaxTier, d.hrActiveMaxTier, 0, 4),
     threshold: num(o.threshold, d.threshold, 0, 100),
+    dailyCollectCap: num(o.dailyCollectCap, d.dailyCollectCap, 1, 300),
     dailyCap: num(o.dailyCap, d.dailyCap, 1, 100),
     includeCompanyContacted: bool(o.includeCompanyContacted, d.includeCompanyContacted),
     applyForeground: bool(o.applyForeground, d.applyForeground),
@@ -188,6 +190,13 @@ export function dailyDue(cfg, state, now = new Date(), catchUpMs = 12 * 3600 * 1
   if (now.getTime() < at.getTime()) return { due: false, at: at.getTime(), reason: '还没到时间' };
   if (now.getTime() - at.getTime() > catchUpMs) return { due: false, at: at.getTime(), missed: true, reason: '已错过今天的运行时间' };
   return { due: true, at: at.getTime(), dateKey: key };
+}
+
+// 今日还能自动收录多少个岗位（用于补详情 + AI 匹配）。
+export function collectQuota(cfg, state, now = new Date()) {
+  const cap = Math.max(0, Number(cfg && cfg.dailyCollectCap) || 0);
+  const used = state && state.collectDate === dateKey(now) ? Math.max(0, Number(state.collected) || 0) : 0;
+  return Math.max(0, cap - used);
 }
 
 // —— 条件判断 ——
@@ -325,10 +334,10 @@ export function applyItemFromJob(job, nowIso = new Date().toISOString()) {
 export function pickApplyCandidates(jobs, cfg, { existing = [], history = {}, now = new Date(), strictFilters = true } = {}) {
   if (!cfg || !Array.isArray(jobs)) return [];
   const nowIso = now instanceof Date ? now.toISOString() : String(now);
-  // 今日清单：投递中 / 待确认 / 已投 / 失败 / 已跳过 都占用每日名额；只有「已忽略」不占，
-  // 否则跳过条目不断累积，清单会无限变长。
-  const kept = (existing || []).filter((it) => it.status !== 'rejected');
-  const room = Math.max(0, (cfg.dailyCap || 0) - kept.length);
+  // 每日清单上限按「当天纳入过多少个」算：已经关闭 / 跳过 / 已投的都占名额，
+  // 否则用户关掉几个就会不断补新岗位，清单永远清不完。
+  const used = (existing || []).length;
+  const room = Math.max(0, (cfg.dailyCap || 0) - used);
   if (!room) return [];
   const seen = new Set((existing || []).map((it) => it.uid));
   const pairSeen = new Set((existing || []).map((it) => pairKey(it)));
@@ -386,7 +395,7 @@ export function countApply(items) {
   return out;
 }
 
-// 把新候选合进今日清单：保留用户已确认 / 已忽略的状态，只追加没出现过的。
+// 把新候选合进今日清单：保留用户已确认 / 已关闭的状态，只追加没出现过的。
 // 跨天自动开一张新清单（历史已投记录单独存，不在这里）。
 export function mergeApplyBatch(batch, candidates, { dateKey: key, now = new Date() } = {}) {
   const nowIso = now instanceof Date ? now.toISOString() : String(now);

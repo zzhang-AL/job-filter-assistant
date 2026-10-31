@@ -1338,6 +1338,8 @@ function renderApplyStatusBar() {
     box.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败', desc: s.lastSearchError || '未知错误' }));
   } else if (s.lastSearchStatus === 'empty') {
     box.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '上次搜索没有新增岗位', desc: s.lastSearchError || '' }));
+  } else if (s.lastSearchStatus === 'capped') {
+    box.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '今日自动收录已达上限', desc: s.lastSearchError || '' }));
   }
   const run = st.run || {};
   if (run.state === 'error' && run.error) {
@@ -1407,6 +1409,14 @@ function renderApplyCard(it) {
       h('div', { class: 'apply-side' }, [
         h('div', { class: 'apply-score', text: String(it.score || 0) }),
         statusChip,
+        (it.status === 'pending' || it.status === 'failed')
+          ? h('button', {
+              class: 'linklike muted apply-close',
+              text: '不想要',
+              title: '从今日清单关闭，不再出现在今天',
+              onclick: (e) => { e.stopPropagation(); rejectApplyItem(it); },
+            })
+          : null,
       ]),
     ]),
     it.summary ? h('div', { class: 'jc-summary tone-' + (it.verdict || 'fair'), text: it.summary }) : null,
@@ -1474,7 +1484,7 @@ function fillApplyBottom(bar) {
     bar.appendChild(
       h('div', { class: 'sel-actions' }, [
         h('button', { class: 'btn btn-sm btn-primary grow', onclick: confirmApply }, [icon('send'), `确认投递 ${selected.length} 个`]),
-        h('button', { class: 'btn btn-sm', text: '忽略所选', onclick: ignoreApplySelected }),
+        h('button', { class: 'btn btn-sm', text: '关闭所选', onclick: closeApplySelected }),
         iconBtn('more', '更多', (e) =>
           openMenu(e.currentTarget, [
             { icon: 'refresh', label: '刷新清单', hint: '把新匹配的岗位补进来', onClick: refreshApplyUi },
@@ -1539,7 +1549,7 @@ async function confirmApply() {
   }
 }
 
-async function ignoreApplySelected() {
+async function closeApplySelected() {
   const uids = [...applyChecked].filter(Boolean);
   if (!uids.length) return;
   try {
@@ -1547,7 +1557,19 @@ async function ignoreApplySelected() {
     applyChecked.clear();
     await refreshApplyStatus();
     render();
-    toast(`已忽略 ${uids.length} 个岗位`);
+    toast(`已关闭 ${uids.length} 个岗位`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function rejectApplyItem(it) {
+  try {
+    await send(MSG.APPLY_ITEM_MARK, { uids: [it.uid], status: 'rejected' });
+    applyChecked.delete(it.uid);
+    await refreshApplyStatus();
+    render();
+    toast(`已关闭「${it.title || '该岗位'}」`);
   } catch (e) {
     toast(e.message, true);
   }

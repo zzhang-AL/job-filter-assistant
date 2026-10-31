@@ -26,7 +26,7 @@ import { mergeSettings } from '../src/common/settingsStore.js';
 import {
   defaultAutoApply, sanitizeAutoApply, buildBossSearchUrl, dailyDue, nextRunAt, dateKey,
   experienceMatches, salaryMatches, cityMatches, hrActiveMatches, matchSearchFilter,
-  eligibleForApply, pickApplyCandidates, mergeApplyBatch, countApply,
+  eligibleForApply, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
 } from '../src/common/autoApply.js';
 import {
   saveApplyBatch, markApplyItems, addApplyHistory, loadApplyHistory, saveAutoApplyState,
@@ -887,6 +887,16 @@ test('默认配置关闭；非法时间 / 关键词 / 薪资被规整', () => {
   assert.deepEqual(fallback.experience, ['3-5年'], '非法年限被过滤');
   assert.equal(sanitizeAutoApply({ dailyCap: 0, threshold: 999 }).dailyCap, 1);
   assert.equal(sanitizeAutoApply({ dailyCap: 0, threshold: 999 }).threshold, 100);
+  assert.equal(sanitizeAutoApply({ dailyCollectCap: 0 }).dailyCollectCap, 1);
+  assert.equal(sanitizeAutoApply({ dailyCollectCap: 999 }).dailyCollectCap, 300);
+});
+
+test('每日收录额度：按本地日期重置，达到上限返回 0', () => {
+  const cfg = { dailyCollectCap: 50 };
+  const now = new Date(2026, 9, 31, 10, 0, 0);
+  assert.equal(collectQuota(cfg, { collectDate: '2026-10-31', collected: 48 }, now), 2);
+  assert.equal(collectQuota(cfg, { collectDate: '2026-10-31', collected: 50 }, now), 0);
+  assert.equal(collectQuota(cfg, { collectDate: '2026-10-30', collected: 50 }, now), 50, '跨天重置');
 });
 
 test('搜索地址带 query 与城市编码', () => {
@@ -986,7 +996,8 @@ test('候选清单：分数排序、每日上限、同公司同名去重、历�
   assert.equal(withCompany.length, 1, '已沟通公司的未沟通岗位进清单');
   const full = [{ uid: 'x1', status: 'skipped' }, { uid: 'x2', status: 'applied' }, { uid: 'x3', status: 'failed' }];
   assert.equal(pickApplyCandidates([APPLY_JOB('boss:c2')], cfg, { existing: full }).length, 0, 'skipped/applied/failed 也占每日名额');
-  assert.equal(pickApplyCandidates([APPLY_JOB('boss:c3')], cfg, { existing: [{ uid: 'x4', status: 'rejected' }] }).length, 1, '已忽略不占名额');
+  assert.equal(pickApplyCandidates([APPLY_JOB('boss:c3')], cfg, { existing: [{ uid: 'x4', status: 'rejected' }] }).length, 1, '清单还有名额时仍可补');
+  assert.equal(pickApplyCandidates([APPLY_JOB('boss:c5')], { ...cfg, dailyCap: 1 }, { existing: [{ uid: 'x6', status: 'rejected' }] }).length, 0, '已关闭的也占用当天名额');
 });
 
 test('清单合并：保留已确认状态、跨天重建、计数', () => {

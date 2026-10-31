@@ -377,3 +377,4 @@
 .apply-card-actions { margin-top: 4px; }
 .apply-list { padding-bottom: 10px; }
 @media (prefers-color-scheme: dark) { .status-applied { color: #30d158; } }
+.apply-close { font-size: 11px; padding: 0; line-height: 1.2; }
