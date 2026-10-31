@@ -583,7 +583,7 @@
       const company = String(msg.company || '').trim().toLowerCase();
       // 只查当前会话头部 / 选中的会话项，别用整个 body（左侧会话列表里可能正好有同公司，造成误判）
       const scope = document.querySelector(
-        '.chat-header, .chat-title, .conversation-detail, .chat-conversation, .chat-content, .chat-panel, .conversation-header, .user-list li.active, .user-list li.on, .user-list li.selected',
+        '.chat-title, .chat-header, .chat-top, .conversation-header, .conversation-detail, .chat-conversation, .chat-content, .chat-panel, .boss-info, .chat-job-name, .user-list li.active, .user-list li.on, .user-list li.selected, .user-list li:first-child',
       );
       if (!scope || !company) {
         sendResponse({ ok: true, matched: idMatch ? true : null, jobId: urlJobId });
