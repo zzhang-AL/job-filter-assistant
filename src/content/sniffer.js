@@ -7,6 +7,10 @@
   window[FLAG] = true;
 
   const CHANNEL = 'job-helper:sniffer';
+  const READY = 'job-helper:sniffer-ready';
+  const MAX_PENDING = 20;
+  const pending = [];
+  let collectorReady = false;
 
   // 与 common/platforms.js 的 matchPlatformApi 保持一致（此处为独立副本）
   function matchApi(urlStr) {
@@ -34,11 +38,26 @@
     return null;
   }
 
+  // collector（document_idle）可能比 sniffer（document_start）晚注入：先缓存，收到 ready 再补发，
+  // 否则 BOSS SPA 启动时第一批 joblist 响应会永久丢失（搜索任务页又没有 DOM 兜底）。
   function post(platform, url, payload) {
+    const msg = { source: CHANNEL, platform, url, payload };
+    if (!collectorReady) {
+      // 保留最早的一批（第一页通常最相关），队列满后丢弃后来的
+      if (pending.length < MAX_PENDING) pending.push(msg);
+      return;
+    }
     try {
-      window.postMessage({ source: CHANNEL, platform, url, payload }, location.origin);
+      window.postMessage(msg, location.origin);
     } catch {}
   }
+  window.addEventListener('message', (ev) => {
+    if (ev.source !== window || !ev.data || ev.data.source !== READY) return;
+    collectorReady = true;
+    for (const msg of pending.splice(0)) {
+      try { window.postMessage(msg, location.origin); } catch {}
+    }
+  });
 
   // —— fetch ——
   const origFetch = window.fetch ? window.fetch.bind(window) : null;

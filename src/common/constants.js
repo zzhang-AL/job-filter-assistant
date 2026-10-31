@@ -1,5 +1,6 @@
 // 全局常量：存储键、消息类型、平台定义。
 import { defaultPacing } from './pacing.js';
+import { defaultAutoApply } from './autoApply.js';
 // 被 background 与各 UI 页以 ES module 方式引入；content-script 侧有独立副本（见 src/content）。
 
 export const STORAGE_KEYS = {
@@ -11,6 +12,9 @@ export const STORAGE_KEYS = {
   lastReport: 'jobHelperLastCaptureReportV1',
   blocked: 'jobHelperBlockedV1', // 屏蔽名单：独立于岗位库，清空岗位库不影响
   contacts: 'jobHelperContactsV1', // 已沟通的公司/岗位（来自 BOSS 沟通页 + 本插件打招呼）
+  applyBatch: 'jobHelperApplyBatchV1', // 今日投递清单（待用户确认 / 已确认 / 已忽略）
+  applyHistory: 'jobHelperApplyHistoryV1', // 历史已投递 uid，避免以后重复推荐
+  autoApplyState: 'jobHelperAutoApplyStateV1', // 每日搜索的运行状态（上次运行时间、结果）
 };
 
 // 平台标识
@@ -114,6 +118,16 @@ export const MSG = {
   AI_USAGE_GET: 'AI_USAGE_GET', // AI 用量与缓存命中统计
   AI_USAGE_RESET: 'AI_USAGE_RESET',
 
+  // 每日自动刷 BOSS + 投递清单
+  AUTO_APPLY_RUN_NOW: 'AUTO_APPLY_RUN_NOW', // UI -> bg：立即跑一次每日搜索
+  AUTO_APPLY_STATUS_GET: 'AUTO_APPLY_STATUS_GET', // UI -> bg：搜索状态 + 今日清单 + 投递进度
+  APPLY_REFRESH: 'APPLY_REFRESH', // UI -> bg：按当前岗位库重新生成（只追加，不覆盖已确认状态）
+  APPLY_ITEM_MARK: 'APPLY_ITEM_MARK', // UI -> bg：确认 / 忽略清单条目
+  APPLY_START: 'APPLY_START', // UI -> bg：用户确认后开始逐个点「立即沟通」
+  APPLY_STOP: 'APPLY_STOP',
+  APPLY_UPDATED: 'APPLY_UPDATED', // bg -> UI：清单或投递进度变化
+  APPLY_CLICK: 'APPLY_CLICK', // bg -> content：在岗位页点「立即沟通」（不自动发送消息）
+
   // 面板控制
   OPEN_OPTIONS: 'OPEN_OPTIONS',
   OPEN_SIDEPANEL: 'OPEN_SIDEPANEL',
@@ -135,6 +149,7 @@ export function defaultSettings() {
     aiConcurrency: 3, // 同时进行的 AI 分析数（受 AI 供应商限流约束，与 BOSS 风控无关）
     settingsRev: 3, // 设置迁移版本：<2 打开 autoScore；<3 把旧「标准」额度 60/时·300/天 升到新标准
     pacing: defaultPacing(), // 后台标签页节奏（模拟人工：随机间隔 / 停留 / 休息 / 活跃时段）
+    autoApply: defaultAutoApply(), // 每日自动刷 BOSS 与投递清单
     showBadge: true, // 在岗位卡片上显示匹配角标
     dedupe: true,
     maxJobs: 800, // 岗位库上限，超出按时间淘汰

@@ -1,7 +1,8 @@
-import { MSG, MODE } from '../common/constants.js';
+import { MSG, MODE, STORAGE_KEYS } from '../common/constants.js';
 import { scoreProfile } from '../common/profile.js';
 import { applyFilters } from '../common/filters.js';
 import { hrActivityTier, activitySortKey, isStaleHr } from '../common/activity.js';
+import { APPLY_STATUS_LABELS } from '../common/autoApply.js';
 import { VERDICT_LABELS, GREETING_LEVELS, normalizeGreetings, DIM_LABELS } from '../common/ai/prompts.js';
 import { send, h, toast, debounce, fmtTime } from './ui-common.js';
 import { icon } from './icons.js';
@@ -19,7 +20,7 @@ const scoring = new Set(); // 正在打分的 uid
 
 // 视图状态
 const view = {
-  tab: 'library', // library | current
+  tab: 'library', // library | apply | current
   sub: 'info', // 当前岗位子页：info | company | greeting
   greetLevel: 'standard', // 招呼语档位：short | standard | detailed
   search: '',
@@ -28,6 +29,11 @@ const view = {
   platform: 'all',
 };
 let lastMode = null; // 上次同步到筛选的平台模式
+// 本地预览用：dev/sidepanel.html?tab=apply 可直接打开投递页；正式侧边栏没有这个参数
+try {
+  const devTab = new URLSearchParams(location.search).get('tab');
+  if (devTab === 'apply' || devTab === 'current') view.tab = devTab;
+} catch {}
 let selectedUid = null; // 手动选中的「当前岗位」；null 时按页面自动识别
 const greetingCache = new Map(); // uid -> 编辑中的招呼语文本（会话态）
 let greetingTextarea = null; // 当前渲染的招呼语输入框引用
@@ -41,6 +47,10 @@ let batchBusy = false; // 批量分析进行中（禁用按钮 + 防重入）
 let autoStatus = null; // 后台状态 { running, pending, done, lastError, lastErrorAt, detail: { running, pending, halted, resumeAt } }
 let batchState = null; // 批量进行中的最新进度（底栏进度条），即 BATCH_STATUS 的返回值
 let batchStopping = false;
+let applyStatus = null; // 今日投递清单 + 每日搜索状态 + 投递进度
+const applyChecked = new Set(); // 投递清单里勾选的 uid
+let applyAutoSelKey = ''; // 已经自动全选过的清单日期（每天只自动选一次，不覆盖用户取消）
+let applyRefreshTimer = null;
 let dismissedErrorAt = 0; // 关掉过的自动分析错误（按出错时间记，新错误照常提示）
 // 点「打开原岗位」后该页会被收录（刷新最近出现、补上 HR 活跃），卡片不能因此跳位：排序沿用点击时的值（会话态）
 const sortFrozen = new Map(); // uid -> { lastSeenAt, savedAt, hrActiveText, hrOnline }
@@ -51,6 +61,12 @@ let lastListKey = '';
 const openedTabs = new Map(); // tabId -> uid
 const reviewing = new Set(); // 正在显示「看完了？」提示的 uid
 const REVIEW_TTL = 3 * 60 * 1000;
+
+// 会话态缓存设上限：用户长时间开着侧边栏翻很多岗位时，避免无限占内存
+function cacheSet(map, key, val, max) {
+  map.set(key, val);
+  while (map.size > max) map.delete(map.keys().next().value);
+}
 
 async function boot() {
   await reload();
@@ -66,6 +82,24 @@ async function boot() {
     } else if (msg.type === MSG.AUTO_STATUS) {
       autoStatus = msg.status;
       updateStatus();
+    } else if (msg.type === MSG.APPLY_UPDATED) {
+      // 搜索进度 / 投递进度可能很密：合并刷新，避免每个岗位都重绘
+      clearTimeout(applyRefreshTimer);
+      applyRefreshTimer = setTimeout(async () => {
+        const wasRunning = !!(applyStatus && applyStatus.run && applyStatus.run.state === 'running');
+        await refreshApplyStatus();
+        if (view.tab !== 'apply') return;
+        const nowRunning = !!(applyStatus && applyStatus.run && applyStatus.run.state === 'running');
+        // 投递进行中只刷新状态条和底栏，避免每投一个岗位整页重绘、列表滚回顶部；
+        // 结束那一次要整页重绘，才能把卡片上的「投递中」换成最终状态。
+        if (wasRunning && nowRunning) {
+          const old = document.getElementById('sp-apply-status');
+          if (old) old.replaceWith(renderApplyStatusBar());
+          fillApplyBottom(document.getElementById('sp-apply-bottom'));
+        } else {
+          render();
+        }
+      }, 300);
     } else if (msg.type === MSG.CURRENT_JOB) {
       // 网站上点开了新岗位：取消手动固定，跟随网站，实时刷新当前岗位视图
       onCurrentJobChanged();
@@ -94,6 +128,14 @@ async function onCurrentJobChanged() {
 }
 
 const reloadSoon = debounce(() => reload({ background: true }), 600);
+// 设置页改了画像 / 供应商 / 设置：这两类数据不随岗位广播变化，单独做一次完整刷新
+const reloadFullSoon = debounce(() => reload(), 800);
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes[STORAGE_KEYS.profile] || changes[STORAGE_KEYS.aiProviders] || changes[STORAGE_KEYS.settings]) reloadFullSoon();
+  });
+} catch {}
 
 // background：由后台广播触发的刷新。用户正在输入（招呼语、搜索框）时先不重绘，等失焦后再补，避免打断输入
 let pendingRender = false;
@@ -117,14 +159,31 @@ app.addEventListener('focusout', () => {
 
 async function reload({ background = false } = {}) {
   try {
-    [jobs, settings, profile, providers, activeCtx] = await Promise.all([
-      send(MSG.JOB_LIST_REQUEST),
-      send(MSG.SETTINGS_GET),
-      send(MSG.PROFILE_GET),
-      send(MSG.AI_PROVIDERS_GET),
-      send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
+    if (background) {
+      // 后台广播只更新会频繁变化的数据；画像 / 供应商由 storage.onChanged 单独触发完整刷新
+      [jobs, settings, activeCtx] = await Promise.all([
+        send(MSG.JOB_LIST_REQUEST),
+        send(MSG.SETTINGS_GET),
+        send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
+      ]);
+    } else {
+      [jobs, settings, profile, providers, activeCtx] = await Promise.all([
+        send(MSG.JOB_LIST_REQUEST),
+        send(MSG.SETTINGS_GET),
+        send(MSG.PROFILE_GET),
+        send(MSG.AI_PROVIDERS_GET),
+        send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
+      ]);
+    }
+    const [st, ap] = await Promise.all([
+      send(MSG.AUTO_STATUS_GET).catch(() => null),
+      send(MSG.AUTO_APPLY_STATUS_GET).catch(() => null),
     ]);
-    autoStatus = await send(MSG.AUTO_STATUS_GET).catch(() => autoStatus);
+    if (st) autoStatus = st;
+    if (ap) {
+      applyStatus = ap;
+      syncApplySelection(ap);
+    }
     // 平台筛选以用户最后一次的选择为准（侧边栏重开也保留）；只有模式设置真的被改了才跟随模式。
     // 后台刷新（收录、标记已沟通、出分数等）不能覆盖用户手动点选的平台
     if (lastMode === null) {
@@ -148,7 +207,35 @@ async function reload({ background = false } = {}) {
     pendingRender = true;
     return;
   }
+  // 投递页：后台每投一个岗位都会广播，重绘时保留滚动位置，避免列表不断跳回顶部
+  if (view.tab === 'apply') {
+    const old = app.querySelector('.sp-list');
+    const top = old ? old.scrollTop : 0;
+    render();
+    const next = app.querySelector('.sp-list');
+    if (next) next.scrollTop = top;
+    return;
+  }
   render();
+}
+
+async function refreshApplyStatus() {
+  applyStatus = await send(MSG.AUTO_APPLY_STATUS_GET).catch(() => applyStatus);
+  syncApplySelection(applyStatus);
+  return applyStatus;
+}
+
+// 每天第一次看到清单时清空勾选；默认不勾选任何岗位，必须由用户主动「全选待确认」再确认。
+// 投递会真实发起沟通，不能因为默认全选而误触。
+function syncApplySelection(st) {
+  const items = (st && st.batch && st.batch.items) || [];
+  const day = (st && st.batch && st.batch.date) || '';
+  if (day && day !== applyAutoSelKey) {
+    applyAutoSelKey = day;
+    applyChecked.clear();
+  }
+  const alive = new Set(items.filter((it) => it.status === 'pending').map((it) => it.uid));
+  for (const uid of [...applyChecked]) if (!alive.has(uid)) applyChecked.delete(uid);
 }
 
 const PLATFORM_FILTER_KEY = 'jobHelperSpPlatform';
@@ -274,7 +361,8 @@ const saveListScroll = debounce(() => {
     localStorage.setItem(LIST_SCROLL_KEY, JSON.stringify(listScroll));
   } catch {}
 }, 300);
-const listScrollKey = () => [view.platform, view.verdict, view.sort, view.search.trim()].join('|');
+// 滚动位置按 tab 分开记：投递清单和岗位库共用 '.sp-list'，不能互相套用偏移
+const listScrollKey = () => [view.tab, view.platform, view.verdict, view.sort, view.search.trim()].join('|');
 
 function render() {
   // 菜单开着时先不重绘（后台广播很密，会把菜单连同锚点一起冲掉），关掉菜单后补上
@@ -317,6 +405,16 @@ function renderNow() {
   if (view.tab === 'current') {
     app.appendChild(renderTopBar(0, 'current'));
     app.appendChild(renderCurrent());
+    return;
+  }
+
+  if (view.tab === 'apply') {
+    app.appendChild(renderTopBar(0, 'apply'));
+    app.appendChild(renderApplyStatusBar());
+    const listEl = h('div', { class: 'sp-list apply-list' });
+    fillApplyList(listEl);
+    app.appendChild(listEl);
+    app.appendChild(renderApplyBottom());
     return;
   }
 
@@ -381,7 +479,7 @@ function renderTopBar(shown, mode) {
     h('div', { class: 'sp-logo', text: '🎯' }),
     h('div', { class: 'sp-head-text' }, [
       h('div', { class: 'sp-title', text: '岗位面板' }),
-      h('div', { class: 'sp-count', id: 'sp-count', text: mode === 'library' ? countText(shown) : ctxLabel() }),
+      h('div', { class: 'sp-count', id: 'sp-count', text: mode === 'library' ? countText(shown) : mode === 'apply' ? applyCountText() : ctxLabel() }),
     ]),
     h('div', { class: 'spacer' }),
     mode === 'current'
@@ -390,11 +488,27 @@ function renderTopBar(shown, mode) {
           await refreshContext();
           render();
         })
-      : null,
+      : mode === 'apply'
+        ? iconBtn('refresh', '刷新今日投递清单', async () => {
+            try {
+              await send(MSG.APPLY_REFRESH);
+              await refreshApplyStatus();
+              render();
+              toast('清单已刷新');
+            } catch (e) {
+              toast(e.message, true);
+            }
+          })
+        : null,
     iconBtn('gear', '设置', () => send(MSG.OPEN_OPTIONS)),
   ]);
 
-  const tabs = h('div', { class: 'sp-tabs', role: 'tablist' }, [tabBtn('library', '岗位库'), tabBtn('current', '当前岗位')]);
+  const pendingApply = (applyStatus && applyStatus.batch && applyStatus.batch.counts && applyStatus.batch.counts.pending) || 0;
+  const tabs = h('div', { class: 'sp-tabs', role: 'tablist' }, [
+    tabBtn('library', '岗位库'),
+    tabBtn('apply', pendingApply ? `投递 ${pendingApply}` : '投递'),
+    tabBtn('current', '当前岗位'),
+  ]);
   const children = [head, tabs];
 
   if (mode === 'library') {
@@ -494,6 +608,7 @@ function tabBtn(key, label) {
       if (view.tab === key) return;
       view.tab = key;
       if (key === 'current') await refreshContext();
+      if (key === 'apply') await refreshApplyStatus();
       render();
     },
   });
@@ -795,7 +910,7 @@ async function blockJobsUi(uids) {
 async function openOriginal(job) {
   // 多次点击以第一次为准，记的是卡片原本的位置
   if (!sortFrozen.has(job.uid)) {
-    sortFrozen.set(job.uid, { lastSeenAt: job.lastSeenAt, savedAt: job.savedAt, hrActiveText: job.hrActiveText, hrOnline: job.hrOnline });
+    cacheSet(sortFrozen, job.uid, { lastSeenAt: job.lastSeenAt, savedAt: job.savedAt, hrActiveText: job.hrActiveText, hrOnline: job.hrOnline }, 500);
   }
   reviewing.delete(job.uid);
   const tab = await chrome.tabs.create({ url: job.url });
@@ -1094,7 +1209,7 @@ function renderGreeting(panel, job) {
           view.greetLevel = lv.key;
           // 切换档位时用该档 AI 文案覆盖编辑区（并存为草稿）
           const text = greetingsOf(job.match)[lv.key] || '';
-          greetingCache.set(job.uid, text);
+          cacheSet(greetingCache, job.uid, text, 200);
           persistGreeting(job.uid, text);
           render();
         },
@@ -1110,7 +1225,7 @@ function renderGreeting(panel, job) {
   greetingTextarea = ta;
   const counter = h('span', { class: 'greet-count', text: `${value.length} 字` });
   ta.addEventListener('input', () => {
-    greetingCache.set(job.uid, ta.value);
+    cacheSet(greetingCache, job.uid, ta.value, 200);
     counter.textContent = `${ta.value.length} 字`;
     persistGreetingDebounced(job.uid, ta.value);
   });
@@ -1221,7 +1336,7 @@ async function tailorAdvice(job) {
   render();
   try {
     const advice = await send(MSG.AI_TAILOR_RESUME, { uid: job.uid, job });
-    tailorCache.set(job.uid, advice);
+    cacheSet(tailorCache, job.uid, advice, 30);
     toast('简历建议已生成');
   } catch (e) {
     toast(`生成失败：${e.message}`, true);
@@ -1232,6 +1347,310 @@ async function tailorAdvice(job) {
 }
 
 // ============ 底栏：批量进度 / 已选操作 / 默认操作 ============
+// ============ 投递清单 ============
+function applyCountText() {
+  if (!applyStatus) return '投递清单';
+  const c = (applyStatus.batch && applyStatus.batch.counts) || {};
+  const date = (applyStatus.batch && applyStatus.batch.date) || '';
+  const closed = c.rejected ? ` · 已关闭 ${c.rejected}` : '';
+  return `${date ? date + ' · ' : ''}待确认 ${c.pending || 0} · 已沟通 ${c.applied || 0}${closed}`;
+}
+
+function renderApplyStatusBar() {
+  const box = h('div', { class: 'sp-status', id: 'sp-apply-status' });
+  const st = applyStatus;
+  if (!st) {
+    box.appendChild(h('div', { class: 'muted', text: '正在读取投递清单…' }));
+    return box;
+  }
+  const s = st.search || {};
+  if (s.running) {
+    box.appendChild(notice({ tone: 'tip', ic: 'refresh', compact: true, title: '正在自动搜索 BOSS…', desc: '完成后自动补详情、AI 匹配，新岗位会补进今日清单' }));
+  } else if (s.lastSearchStatus === 'error') {
+    box.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败', desc: s.lastSearchError || '未知错误' }));
+  } else if (s.lastSearchStatus === 'empty') {
+    box.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '上次搜索没有新增岗位', desc: s.lastSearchError || '' }));
+  } else if (s.lastSearchStatus === 'capped') {
+    box.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '今日自动收录已达上限', desc: s.lastSearchError || '' }));
+  }
+  const run = st.run || {};
+  if (run.state === 'error' && run.error) {
+    box.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次投递中断', desc: run.error }));
+  }
+  return box;
+}
+
+function sortedApplyItems(items) {
+  const rank = { pending: 0, failed: 1, applied: 2, skipped: 3, rejected: 4 };
+  return items.slice().sort((a, b) => {
+    const ra = rank[a.status] == null ? 9 : rank[a.status];
+    const rb = rank[b.status] == null ? 9 : rank[b.status];
+    return ra !== rb ? ra - rb : (Number(b.score) || 0) - (Number(a.score) || 0);
+  });
+}
+
+function fillApplyList(listEl) {
+  listEl.innerHTML = '';
+  const all = sortedApplyItems((applyStatus && applyStatus.batch && applyStatus.batch.items) || []);
+  // 已关闭的岗位从清单里移除，只留在统计里；避免关闭后还占着列表
+  const items = all.filter((it) => it.status !== 'rejected');
+  if (!items.length) {
+    const cfg = (applyStatus && applyStatus.config) || {};
+    const counts = (applyStatus && applyStatus.batch && applyStatus.batch.counts) || {};
+    if (all.length) {
+      const parts = [];
+      if (counts.applied) parts.push(`已沟通 ${counts.applied} 个`);
+      if (counts.rejected) parts.push(`已关闭 ${counts.rejected} 个`);
+      if (counts.skipped) parts.push(`已跳过 ${counts.skipped} 个`);
+      if (!parts.length) parts.push(`共 ${all.length} 个岗位`);
+      listEl.appendChild(
+        emptyState(
+          'check',
+          '今天的投递清单已处理完',
+          `${parts.join('、')}；明天会重新生成清单，也可以在设置里调高每日清单上限。`,
+          { label: '刷新清单', onClick: refreshApplyUi },
+        ),
+      );
+      return;
+    }
+    const hasKeywords = Array.isArray(cfg.keywords) && cfg.keywords.length > 0;
+    listEl.appendChild(
+      emptyState(
+        'send',
+        '今天还没有待投递岗位',
+        hasKeywords
+          ? `每天 ${cfg.dailyTime || '09:00'} 自动搜索并生成清单；也可以现在手动跑一次。匹配分达到 ${cfg.threshold ?? 70} 的未沟通岗位会出现在这里。`
+          : '先到设置 → 自动投递配置岗位关键词、城市和筛选条件。',
+        hasKeywords
+          ? { label: '立即搜索 BOSS', onClick: runDailySearchUi }
+          : { label: '去设置自动投递', onClick: () => send(MSG.OPEN_OPTIONS, { section: 'autoapply' }) },
+      ),
+    );
+    return;
+  }
+  for (const it of items) listEl.appendChild(renderApplyCard(it));
+}
+
+function renderApplyCard(it) {
+  const pending = it.status === 'pending';
+  const running = !!(applyStatus && applyStatus.run && applyStatus.run.state === 'running');
+  const canEdit = pending && !running;
+  const on = applyChecked.has(it.uid);
+  const cb = h('input', { type: 'checkbox' });
+  cb.checked = on;
+  cb.disabled = !canEdit;
+  const card = h('div', { class: 'job-card apply-card' + (on ? ' is-checked' : '') + (pending ? '' : ' is-done') });
+  cb.addEventListener('change', () => {
+    if (cb.checked) applyChecked.add(it.uid);
+    else applyChecked.delete(it.uid);
+    card.classList.toggle('is-checked', cb.checked);
+    fillApplyBottom(document.getElementById('sp-apply-bottom'));
+  });
+  const statusChip = h('span', { class: 'apply-status status-' + it.status, text: APPLY_STATUS_LABELS[it.status] || it.status });
+  const meta = [it.city, it.district, it.experience].filter(Boolean).join(' · ');
+  const children = [
+    h('div', { class: 'jc-head' }, [
+      pending ? h('label', { class: 'jc-check' }, [cb]) : h('span', { class: 'jc-check' }),
+      h('div', { class: 'jc-main', onclick: () => openOriginal(it) }, [
+        h('div', { class: 'jc-title-row' }, [
+          h('div', { class: 'jc-title', text: it.title || '（未命名岗位）' }),
+          h('div', { class: 'jc-salary', text: it.salaryText || '面议' }),
+        ]),
+        h('div', { class: 'jc-company', text: it.company || '' }),
+        meta ? h('div', { class: 'jc-meta' }, [h('span', { class: 'jc-meta-text', text: meta })]) : null,
+      ]),
+      h('div', { class: 'apply-side' }, [
+        h('div', { class: 'apply-score', text: String(it.score || 0) }),
+        statusChip,
+        (it.status === 'pending' || it.status === 'failed') && !running
+          ? h('button', {
+              class: 'linklike muted apply-close',
+              text: '不想要',
+              title: '不想要：从清单关闭，并从以后推荐中排除（可在岗位库恢复）',
+              onclick: (e) => { e.stopPropagation(); rejectApplyItem(it); },
+            })
+          : null,
+      ]),
+    ]),
+    it.summary ? h('div', { class: 'jc-summary tone-' + (it.verdict || 'fair'), text: it.summary }) : null,
+    h('div', { class: 'jc-tags' }, [
+      it.hrActiveText ? activityChip(it) : null,
+      it.companyContacted ? h('span', { class: 'chip chip-orange', text: '同公司其他岗位' }) : null,
+      it.hasGreeting ? h('span', { class: 'chip', text: '有招呼语草稿' }) : null,
+    ].filter(Boolean)),
+    it.note ? h('div', { class: 'apply-note', text: it.note }) : null,
+    it.status === 'failed'
+      ? h('div', { class: 'apply-card-actions' }, [
+          h('button', { class: 'linklike', text: '重试', onclick: (e) => { e.stopPropagation(); retryApplyItem(it); } }),
+        ])
+      : null,
+  ].filter(Boolean);
+  card.append(...children);
+  return card;
+}
+
+function renderApplyBottom() {
+  const bar = h('div', { class: 'sp-bottom', id: 'sp-apply-bottom' });
+  fillApplyBottom(bar);
+  return bar;
+}
+
+function fillApplyBottom(bar) {
+  if (!bar) return;
+  bar.innerHTML = '';
+  bar.className = 'sp-bottom';
+  const st = applyStatus;
+  const run = st && st.run;
+  if (run && run.state === 'running') {
+    bar.classList.add('is-batch');
+    const done = (run.done || 0) + (run.failed || 0);
+    const pct = run.total ? Math.round((done / run.total) * 100) : 0;
+    bar.appendChild(
+      h('div', { class: 'batch-panel' }, [
+        h('div', { class: 'batch-head' }, [
+          icon('send', { cls: 'batch-ico' }),
+          h('span', { class: 'batch-title', text: `正在投递 ${done} / ${run.total}` }),
+          h('div', { class: 'spacer' }),
+          h('button', { class: 'btn btn-xs btn-danger', text: '停止', onclick: stopApplyUi }),
+        ]),
+        h('div', { class: 'progress' }, [h('span', { class: 'progress-fill', style: `width:${pct}%` })]),
+        run.current ? h('div', { class: 'batch-sub', text: '正在打开岗位页并点击「立即沟通」…' }) : null,
+      ]),
+    );
+    return;
+  }
+  const items = (st && st.batch && st.batch.items) || [];
+  const pending = items.filter((it) => it.status === 'pending');
+  const selected = pending.filter((it) => applyChecked.has(it.uid));
+  if (selected.length) {
+    bar.classList.add('has-sel');
+    bar.appendChild(
+      h('div', { class: 'sel-row' }, [
+        h('span', { class: 'sel-count', text: `已选 ${selected.length} 个` }),
+        selected.length === pending.length
+          ? null
+          : h('button', { class: 'linklike', text: `全选待确认（${pending.length}）`, onclick: selectAllApply }),
+        h('div', { class: 'spacer' }),
+        h('button', { class: 'linklike muted', text: '取消选择', onclick: () => { applyChecked.clear(); render(); } }),
+      ]),
+    );
+    bar.appendChild(
+      h('div', { class: 'sel-actions' }, [
+        h('button', { class: 'btn btn-sm btn-primary grow', onclick: confirmApply }, [icon('send'), `确认投递 ${selected.length} 个`]),
+        h('button', { class: 'btn btn-sm', text: '关闭所选', onclick: closeApplySelected }),
+        iconBtn('more', '更多', (e) =>
+          openMenu(e.currentTarget, [
+            { icon: 'refresh', label: '刷新清单', hint: '把新匹配的岗位补进来', onClick: refreshApplyUi },
+            { icon: 'gear', label: '自动投递设置', hint: '搜索条件、时间和每日上限', onClick: () => send(MSG.OPEN_OPTIONS, { section: 'autoapply' }) },
+          ]),
+        ),
+      ]),
+    );
+    return;
+  }
+  bar.appendChild(
+    h('button', { class: 'btn btn-sm btn-ghost', disabled: !pending.length, onclick: selectAllApply }, [
+      icon('check'),
+      `全选待确认（${pending.length}）`,
+    ]),
+  );
+  bar.appendChild(h('div', { class: 'spacer' }));
+  bar.appendChild(h('button', { class: 'btn btn-sm', onclick: refreshApplyUi }, [icon('refresh'), '刷新清单']));
+}
+
+async function refreshApplyUi() {
+  try {
+    await send(MSG.APPLY_REFRESH);
+    await refreshApplyStatus();
+    render();
+    toast('清单已刷新');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function runDailySearchUi() {
+  try {
+    const r = await send(MSG.AUTO_APPLY_RUN_NOW);
+    toast(r && r.started ? '已开始自动搜索，完成后清单会自动更新' : '搜索已经在进行中');
+    await refreshApplyStatus();
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function selectAllApply() {
+  const items = (applyStatus && applyStatus.batch && applyStatus.batch.items) || [];
+  for (const it of items) if (it.status === 'pending') applyChecked.add(it.uid);
+  render();
+}
+
+async function confirmApply() {
+  const items = (applyStatus && applyStatus.batch && applyStatus.batch.items) || [];
+  const uids = items.filter((it) => it.status === 'pending' && applyChecked.has(it.uid)).map((it) => it.uid);
+  if (!uids.length) return;
+  if (!confirm(`确认向选中的 ${uids.length} 个岗位发起沟通？\n\n会依次打开岗位页并点击「立即沟通」，不会自动发送聊天消息。`)) return;
+  try {
+    await send(MSG.APPLY_START, { uids });
+    applyChecked.clear();
+    await refreshApplyStatus();
+    render();
+    toast('开始投递；请保持 Chrome 运行，可随时点「停止」');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function closeApplySelected() {
+  const uids = [...applyChecked].filter(Boolean);
+  if (!uids.length) return;
+  if (!confirm(`关闭选中的 ${uids.length} 个岗位？\n\n关闭后会标为「不感兴趣」，以后不再推荐（可在岗位库恢复）；今天清单名额不会返还。`)) return;
+  try {
+    await send(MSG.APPLY_ITEM_MARK, { uids, status: 'rejected' });
+    applyChecked.clear();
+    await refreshApplyStatus();
+    render();
+    toast(`已关闭 ${uids.length} 个岗位，可在岗位库恢复`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function rejectApplyItem(it) {
+  try {
+    await send(MSG.APPLY_ITEM_MARK, { uids: [it.uid], status: 'rejected' });
+    applyChecked.delete(it.uid);
+    await refreshApplyStatus();
+    render();
+    toast(`已关闭「${it.title || '该岗位'}」，可在岗位库恢复`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function retryApplyItem(it) {
+  try {
+    await send(MSG.APPLY_ITEM_MARK, { uids: [it.uid], status: 'pending' });
+    applyChecked.add(it.uid);
+    await refreshApplyStatus();
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function stopApplyUi() {
+  try {
+    await send(MSG.APPLY_STOP);
+    toast('已请求停止，当前岗位完成后结束');
+    await refreshApplyStatus();
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
 function renderBottom(list) {
   const bar = h('div', { class: 'sp-bottom', id: 'sp-bottom-bar' });
   fillBottom(bar, list);
@@ -1366,7 +1785,7 @@ async function sendGreeting(job) {
     if (!confirm(`确认发送给 ${job.company || 'HR'}？\n\n${text}`)) return;
   }
   // 以当前文本为准，落库
-  greetingCache.set(job.uid, text);
+  cacheSet(greetingCache, job.uid, text, 200);
   persistGreeting(job.uid, text);
   // 先复制到剪贴板兜底（无论聊天能否自动填入，招呼语都在手上）
   copyText(text);
@@ -1405,7 +1824,7 @@ async function generateGreetingUi(job, force = false) {
     if (force) toast('已重新生成招呼语');
     return true;
   } catch (e) {
-    greetFailed.set(job.uid, e.message);
+    cacheSet(greetFailed, job.uid, e.message, 200);
     toast(e.message, true);
     return false;
   } finally {

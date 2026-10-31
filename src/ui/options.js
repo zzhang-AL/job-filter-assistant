@@ -4,6 +4,7 @@ import { PRESETS, PROTOCOLS, PROTOCOL_LABELS, providerFromPreset, validateProvid
 import { send, h, toast, toList, debounce, fmtTime } from './ui-common.js';
 import { parseResumeFile } from './resumeParser.js';
 import { PACING_PRESETS } from '../common/pacing.js';
+import { BOSS_CITY_CODES, EXPERIENCE_OPTIONS, HR_ACTIVE_OPTIONS } from '../common/autoApply.js';
 import { contactKey } from '../common/platforms.js';
 import { evaluateJob } from '../common/filters.js';
 import { icon } from './icons.js';
@@ -16,12 +17,14 @@ let settings = null;
 let providers = [];
 let profile = null;
 let halt = null; // 后台补全熔断（自动化页提示 + 导航角标）
+let applyStatus = null; // 今日投递清单 / 每日搜索状态
 
 const SECTIONS = [
   { id: 'profile', icon: 'user', label: '个人画像', desc: 'AI 用它判断岗位是否匹配、生成招呼语和简历建议。画像越完整，结果越准。', render: renderProfile },
   { id: 'ai', icon: 'plug', label: 'AI 接口', desc: '兼容 OpenAI / Anthropic / Gemini 等协议，可接入任意兼容供应商或本地模型。只有「当前启用」的那个会被调用。', render: renderAi },
   { id: 'filters', icon: 'filter', label: '岗位筛选', desc: '本地规则先过一遍（不消耗 AI）。不满足条件的岗位不会出现在侧边栏列表里。', render: renderFilters },
   { id: 'automation', icon: 'zap', label: '自动化', desc: '浏览时自动收录、后台补全 BOSS 详情、自动 AI 分析，以及后台标签页的节奏。', render: renderAutomation },
+  { id: 'autoapply', icon: 'send', label: '自动投递', desc: '每天定时刷 BOSS、补详情、AI 匹配，生成待确认清单；你点确认后才逐个点「立即沟通」。', render: renderAutoApply },
   { id: 'lists', icon: 'block', label: '已沟通与屏蔽', desc: '沟通过的岗位不再重复收录和匹配；屏蔽的岗位永久不再收录，清空岗位库也不影响。', render: renderLists },
   { id: 'privacy', icon: 'shield', label: '隐私与数据', desc: '发送给 AI 的数据范围、岗位数据的导出与清理。所有数据只保存在本机浏览器。', render: renderPrivacy },
 ];
@@ -37,11 +40,12 @@ async function boot() {
 
 async function reloadAll() {
   let ov;
-  [settings, providers, profile, ov] = await Promise.all([
+  [settings, providers, profile, ov, applyStatus] = await Promise.all([
     send(MSG.SETTINGS_GET),
     send(MSG.AI_PROVIDERS_GET),
     send(MSG.PROFILE_GET),
     send(MSG.CONTACTS_GET).catch(() => null),
+    send(MSG.AUTO_APPLY_STATUS_GET).catch(() => null),
   ]);
   profile = sanitizeProfile(profile);
   halt = ov && ov.halt;
@@ -80,6 +84,11 @@ function navBadge(id) {
   }
   if (id === 'filters') return settings.filters.enabled ? { text: '已启用', tone: 'ok' } : null;
   if (id === 'automation' && halt) return { text: '已暂停', tone: 'warn', title: halt.reason };
+  if (id === 'autoapply') {
+    const pending = (applyStatus && applyStatus.batch && applyStatus.batch.counts && applyStatus.batch.counts.pending) || 0;
+    if (pending) return { text: `${pending} 待投`, tone: 'warn', title: '今日投递清单待确认' };
+    return settings.autoApply.enabled ? { text: '已开启', tone: 'ok' } : null;
+  }
   return null;
 }
 
@@ -213,7 +222,14 @@ function numInput({ value, min, max, unit, width = 76, onCommit }) {
   const input = h('input', { type: 'number', min, max, value: value ?? '', style: `width:${width}px` });
   input.addEventListener('change', async () => {
     const shown = await onCommit(input.value === '' ? null : Number(input.value));
-    if (shown !== undefined && document.activeElement !== input) input.value = shown ?? '';
+    if (shown !== undefined) {
+      // 越界值会被后台收敛（如 500 → 100）；无论是否失焦都回写，避免界面显示的值和实际保存值不一致
+      if (String(shown ?? '') !== input.value) {
+        input.classList.add('invalid');
+        setTimeout(() => input.classList.remove('invalid'), 1200);
+      }
+      input.value = shown ?? '';
+    }
   });
   return unit ? h('span', { class: 'num-wrap' }, [input, h('span', { class: 'num-unit', text: unit })]) : input;
 }
@@ -737,6 +753,29 @@ function renderProviderCard(prov, isActive) {
   const modelInput = bind('model', { ph: '如 gpt-4o-mini' });
   const modelList = h('datalist', { id: `models-${prov.id}` }, prov.discoveredModels.map((m) => opt(m, m)));
   modelInput.setAttribute('list', `models-${prov.id}`);
+  // datalist 在部分 Chrome / 扩展页面里点击时不会弹候选（没有可见的箭头），
+  // 拉取到模型后再给一个真正的 <select>，保证“展开下拉框”一定可用。
+  const modelSelect = prov.discoveredModels.length
+    ? h('select', { class: 'model-select', 'aria-label': '选择已拉取的模型' }, [
+        opt('', `选择模型（${prov.discoveredModels.length} 个）`),
+        ...prov.discoveredModels.map((m) => opt(m, m)),
+      ])
+    : null;
+  if (modelSelect) {
+    modelSelect.value = prov.discoveredModels.includes(prov.model) ? prov.model : '';
+    modelSelect.addEventListener('change', async () => {
+      if (!modelSelect.value) return;
+      prov.model = modelSelect.value;
+      modelInput.value = prov.model;
+      await saveProviders(providers);
+      toast(`已选择模型 ${prov.model}`);
+    });
+    // 手动改模型 ID 时同步下拉，避免两个控件显示不同模型
+    modelInput.addEventListener('input', () => {
+      const v = modelInput.value.trim();
+      modelSelect.value = prov.discoveredModels.includes(v) ? v : '';
+    });
+  }
 
   const keyInput = bind('apiKey', { type: 'password', ph: 'sk-...' });
   const keyWrap = h('div', { class: 'secret' }, [
@@ -772,7 +811,7 @@ function renderProviderCard(prov, isActive) {
       field('API Base URL', bind('baseUrl', { ph: 'https://api.example.com/v1' })),
       h('div', { class: 'grid-2' }, [
         field(prov.protocol === 'gemini' ? 'API Key（通过 query 传递）' : 'API Key', keyWrap, { hint: '只保存在本机' }),
-        field('模型 ID', h('div', {}, [modelInput, modelList]), { hint: prov.discoveredModels.length ? `已拉取 ${prov.discoveredModels.length} 个模型，输入框可下拉选择` : '可点「拉取模型列表」获取候选' }),
+        field('模型 ID', h('div', { class: 'model-field' }, [modelInput, modelList, modelSelect].filter(Boolean)), { hint: prov.discoveredModels.length ? `已拉取 ${prov.discoveredModels.length} 个模型，可从下拉框选择，也可直接输入` : '可点「拉取模型列表」获取候选' }),
       ]),
       advToggle,
       advWrap,
@@ -850,9 +889,14 @@ async function testProv(prov, el) {
 async function fetchModels(prov, el) {
   setResult(el, 'busy', '拉取模型中…');
   try {
-    prov.discoveredModels = await send(MSG.AI_PROVIDER_MODELS, { provider: prov });
+    const list = await send(MSG.AI_PROVIDER_MODELS, { provider: prov });
+    prov.discoveredModels = Array.isArray(list) ? list : [];
     await saveProviders(providers);
-    toast(`发现 ${prov.discoveredModels.length} 个模型，已加到模型输入框的下拉候选`);
+    if (!prov.discoveredModels.length) {
+      setResult(el, 'err', '接口没有返回模型列表。部分供应商不支持列出模型，可手动填写模型 ID，或在「高级设置」里填写自定义模型列表 URL。');
+      return;
+    }
+    toast(`发现 ${prov.discoveredModels.length} 个模型，可在模型 ID 下方下拉框选择`);
     route();
   } catch (e) {
     setResult(el, 'err', e.message + '（部分供应商不支持列出模型，可手动填写模型 ID）');
@@ -1069,6 +1113,271 @@ function renderPacingPanel() {
 }
 
 // ============================================================
+//  自动投递
+// ============================================================
+function renderAutoApply() {
+  const cfg = settings.autoApply;
+  const save = debounce(() => saveSettings({ autoApply: cfg }), 350);
+  const saveNow = () => saveSettings({ autoApply: cfg });
+  const changed = () => { refreshNav(); save(); };
+
+  mainEl.appendChild(
+    notice({
+      tone: 'warn',
+      ic: 'alert',
+      title: '自动投递会真实点击「立即沟通」',
+      desc: '每天定时在后台打开 BOSS 搜索页收录岗位，完成后生成待确认清单；只有你在侧边栏点「确认投递」后，才会逐个打开岗位页点「立即沟通」。不会自动发送任何聊天消息。请控制数量、保持默认节奏，并遵守平台服务条款。',
+    }),
+  );
+
+  // —— 状态 ——
+  const statusBox = h('div', { class: 'auto-status' });
+  let pollTimer = null;
+  const refresh = async () => {
+    try {
+      applyStatus = await send(MSG.AUTO_APPLY_STATUS_GET);
+    } catch {}
+    paint(applyStatus);
+    refreshNav();
+    schedulePoll();
+  };
+  const schedulePoll = () => {
+    clearTimeout(pollTimer);
+    if (current !== 'autoapply' || !applyStatus) return;
+    if (applyStatus.search?.running || applyStatus.run?.state === 'running') {
+      pollTimer = setTimeout(() => { if (current === 'autoapply') refresh().catch(() => {}); }, 2500);
+    }
+  };
+  const paint = (st) => {
+    statusBox.replaceChildren();
+    if (!st) {
+      statusBox.appendChild(h('div', { class: 'muted', text: '正在读取状态…' }));
+      return;
+    }
+    const s = st.search || {};
+    const counts = (st.batch && st.batch.counts) || {};
+    const run = st.run || {};
+    if (s.running) {
+      statusBox.appendChild(notice({ tone: 'tip', ic: 'refresh', compact: true, title: '正在自动搜索 BOSS…', desc: '会依次搜索配置的岗位关键词；完成后自动补详情、AI 匹配，并把新岗位补进今日清单。' }));
+    } else if (s.lastSearchStatus === 'error') {
+      statusBox.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败', desc: s.lastSearchError || '未知错误' }));
+    } else if (s.lastSearchStatus === 'empty') {
+      statusBox.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '上次搜索没有新增岗位', desc: s.lastSearchError || '' }));
+    } else if (s.lastSearchStatus === 'capped') {
+      statusBox.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '今日自动收录已达上限', desc: s.lastSearchError || '' }));
+    } else if (s.lastSearchAt) {
+      statusBox.appendChild(notice({ tone: 'tip', ic: 'check', compact: true, title: `上次搜索：${fmtTime(s.lastSearchAt)}`, desc: `新增 ${s.lastSearchCount || 0} 个岗位` }));
+    }
+    if (!settings.autoScore) {
+      statusBox.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '自动 AI 分析未开启', desc: '投递清单依赖匹配分，请先到「自动化」开启自动 AI 分析。', actions: [{ label: '去开启', primary: true, onClick: () => go('automation') }] }));
+    }
+
+    const stat = h('div', { class: 'auto-stats' }, [
+      statCell('待确认', counts.pending || 0, 'accent'),
+      statCell('已沟通', counts.applied || 0, 'green'),
+      statCell('已关闭', counts.rejected || 0, 'muted'),
+      statCell('清单日期', st.batch?.date || '—', 'muted'),
+    ]);
+    statusBox.appendChild(stat);
+    const collect = st.collect || {};
+    const listCap = (st.config && st.config.dailyCap) || 0;
+    statusBox.appendChild(
+      h('div', { class: 'auto-collect', text: `今日自动收录 ${collect.count || 0} / ${collect.cap || 0} 个岗位（用于补详情与 AI 匹配）` }),
+    );
+    statusBox.appendChild(
+      h('div', { class: 'auto-collect', text: `今日清单 ${counts.total || 0} / ${listCap || 0} 个（含已关闭 / 已投 / 已跳过）` }),
+    );
+
+    if (run.state === 'running') {
+      const done = (run.done || 0) + (run.failed || 0);
+      const pct = run.total ? Math.round((done / run.total) * 100) : 0;
+      statusBox.appendChild(
+        h('div', { class: 'auto-run' }, [
+          h('div', { class: 'auto-run-head' }, [
+            h('span', { class: 'spinner spinner-sm' }),
+            h('b', { text: `正在投递 ${done} / ${run.total}` }),
+            h('span', { class: 'spacer' }),
+            h('button', { class: 'btn btn-xs', text: '停止', onclick: async () => { await send(MSG.APPLY_STOP).catch(() => {}); toast('已请求停止，当前岗位完成后结束'); refresh(); } }),
+          ]),
+          h('div', { class: 'auto-progress' }, [h('span', { class: 'auto-progress-fill', style: `width:${pct}%` })]),
+        ]),
+      );
+    } else if (run.state === 'done' || run.state === 'stopped' || run.state === 'error') {
+      const tone = run.state === 'error' ? 'warn' : 'tip';
+      statusBox.appendChild(notice({
+        tone,
+        ic: run.state === 'error' ? 'alert' : 'check',
+        compact: true,
+        title: run.state === 'error' ? '上次投递中断' : run.state === 'stopped' ? '投递已停止' : '上次投递完成',
+        desc: `成功 ${run.done || 0} 个${run.failed ? ` · 失败 ${run.failed} 个` : ''}${run.error ? ` · ${run.error}` : ''}`,
+      }));
+    }
+
+    const next = s.nextRunAt ? fmtTime(s.nextRunAt) : '';
+    statusBox.appendChild(
+      h('div', { class: 'auto-actions' }, [
+        h('button', { class: 'btn btn-sm btn-primary', disabled: s.running, onclick: runNow }, [icon('zap'), '立即运行一次']),
+        h('button', { class: 'btn btn-sm', onclick: refreshList }, [icon('refresh'), '刷新今日清单']),
+        h('button', { class: 'btn btn-sm btn-ghost', onclick: openSidePanelUi }, [icon('external'), '在侧边栏查看']),
+        next ? h('span', { class: 'auto-next', text: `下次自动运行：${next}` }) : null,
+      ]),
+    );
+  };
+  async function runNow() {
+    try {
+      const r = await send(MSG.AUTO_APPLY_RUN_NOW);
+      toast(r && r.started ? '已开始每日搜索，完成后清单会自动更新' : '任务已经在运行');
+      setTimeout(refresh, 800);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+  async function refreshList() {
+    try {
+      applyStatus = await send(MSG.APPLY_REFRESH);
+      paint(applyStatus);
+      refreshNav();
+      toast('今日清单已更新');
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+  async function openSidePanelUi() {
+    try {
+      const w = await chrome.windows.getCurrent();
+      await chrome.sidePanel.open({ windowId: w.id });
+    } catch {
+      send(MSG.OPEN_SIDEPANEL).catch(() => {});
+    }
+  }
+
+  paint(applyStatus);
+  schedulePoll();
+  mainEl.appendChild(panel('今日状态', '清单每天生成一次；之后补完详情 / 匹配的岗位会自动追加，已确认或已关闭的不会被覆盖。', [statusBox]));
+
+  // —— 每日搜索配置 ——
+  const timeInput = h('input', { type: 'time', value: cfg.dailyTime, style: 'width:120px' });
+  timeInput.addEventListener('change', async () => {
+    if (!timeInput.value) return;
+    cfg.dailyTime = timeInput.value;
+    await saveNow();
+    refresh();
+  });
+
+  const cityNames = Object.keys(BOSS_CITY_CODES);
+  const citySel = h('select', {}, [...cityNames.map((n) => opt(n, n === '全国' ? '全国（不限城市）' : n)), opt('custom', '其他（手动填编码）')]);
+  citySel.value = cityNames.includes(cfg.cityName) ? cfg.cityName : 'custom';
+  const codeInput = h('input', { type: 'text', value: cfg.cityCode, placeholder: '如 101280100', style: 'width:150px' });
+  citySel.addEventListener('change', () => {
+    if (citySel.value !== 'custom') {
+      cfg.cityName = citySel.value;
+      cfg.cityCode = BOSS_CITY_CODES[citySel.value];
+      codeInput.value = cfg.cityCode;
+    } else {
+      // 手动填编码时不做本地城市名过滤（只靠搜索 URL 的 city= 限定）
+      cfg.cityName = '自定义';
+    }
+    changed();
+  });
+  codeInput.addEventListener('change', () => {
+    const v = codeInput.value.trim();
+    if (v && !/^\d{6,12}$/.test(v)) return toast('城市编码应为 6–12 位数字，可在 BOSS 城市页 URL 的 city= 后找到', true);
+    cfg.cityCode = v || BOSS_CITY_CODES[cfg.cityName] || '100010000';
+    codeInput.value = cfg.cityCode;
+    const mapped = BOSS_CITY_CODES[cfg.cityName];
+    // 手改编码且与当前城市不匹配：切换为「自定义」，避免用旧城市名做本地过滤
+    if (citySel.value === 'custom' || !cityNames.includes(cfg.cityName) || (v && mapped && v !== mapped)) {
+      cfg.cityName = '自定义';
+      citySel.value = 'custom';
+    }
+    changed();
+  });
+
+  const expChips = multiChips(EXPERIENCE_OPTIONS, cfg.experience, (arr) => { cfg.experience = arr; changed(); });
+  const salary = (key, ph) => {
+    const input = h('input', { type: 'number', min: 0, value: cfg[key] ?? '', placeholder: ph });
+    input.addEventListener('input', () => { cfg[key] = input.value === '' ? null : Number(input.value); changed(); });
+    return h('span', { class: 'num-wrap' }, [input, h('span', { class: 'num-unit', text: 'k/月' })]);
+  };
+
+  const hrSel = h('select', {}, HR_ACTIVE_OPTIONS.map(([v, l]) => opt(String(v), l)));
+  hrSel.value = String(cfg.hrActiveMaxTier);
+  hrSel.addEventListener('change', () => { cfg.hrActiveMaxTier = Number(hrSel.value); changed(); });
+
+  mainEl.appendChild(
+    panel('每日搜索', '定时在后台打开 BOSS 搜索页，让页面自己加载岗位列表并向下滚动；插件只读页面已经取回的数据。', [
+      setRow('启用每日自动搜索', '到达设定时间后自动运行；Chrome 没开时会顺延，错过太久不会在深夜补跑', cfg.enabled, (v) => {
+        cfg.enabled = v;
+        saveNow();
+        refreshNav();
+        if (v && !settings.autoScore) toast('提醒：还需要到「自动化」开启自动 AI 分析，清单才有匹配分', true);
+        refresh();
+      }),
+      ctlRow('每天运行时间', '建议设置在电脑通常开机的时段。自动任务不受活跃时段限制，但仍受每小时 / 每天上限和验证熔断保护', timeInput),
+      field('岗位关键词', tagEditor(cfg.keywords, (arr) => { cfg.keywords = arr; changed(); }, '如 前端、React；可填多个'), { hint: '多个关键词会依次搜索；留空不会运行' }),
+      h('div', { class: 'grid-2' }, [
+        field('城市', citySel, { hint: '选择常用城市，或选「其他」后填写编码' }),
+        field('城市编码', codeInput, { hint: 'BOSS 搜索页 URL 里 city= 后面的数字' }),
+      ]),
+      field('工作年限要求', expChips, { hint: '可多选；按岗位年限区间重叠判断。不选 = 不限' }),
+      h('div', { class: 'grid-2' }, [field('薪资下限', salary('salaryMinK', '如 15')), field('薪资上限', salary('salaryMaxK', '如 35'))]),
+      field('HR 活跃要求', hrSel, { hint: '详情补齐后按 HR 最近活跃时间判断；越活跃越可能在招' }),
+      h('div', { class: 'grid-2' }, [
+        ctlRow('每次滚动', '每次搜索向下滚动几次，越多收录越多，也越慢', numInput({ value: cfg.scrolls, min: 1, max: 10, unit: '次', onCommit: async (v) => { cfg.scrolls = v ?? 4; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.scrolls; } })),
+        ctlRow('匹配分门槛', '低于这个分数的岗位不进清单', numInput({ value: cfg.threshold, min: 0, max: 100, unit: '分', onCommit: async (v) => { cfg.threshold = v ?? 70; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.threshold; } })),
+      ]),
+      ctlRow('每日最多收录', '每天自动搜索最多新收录多少个岗位用于补详情和 AI 匹配；达到上限当天不再收录', numInput({ value: cfg.dailyCollectCap, min: 1, max: 300, unit: '个', onCommit: async (v) => { cfg.dailyCollectCap = v ?? 50; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCollectCap; } })),
+      ctlRow('每日清单上限', '每天最多纳入多少个岗位；已关闭 / 已投 / 已跳过的也占当天名额，第二天重新计算', numInput({ value: cfg.dailyCap, min: 1, max: 100, unit: '个', onCommit: async (v) => { cfg.dailyCap = v ?? 20; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCap; } })),
+      setRow('保留已沟通公司的其他岗位', '已沟通过的公司，其「未沟通」的岗位仍然纳入清单；已沟通过的岗位本身永远跳过', cfg.includeCompanyContacted, (v) => { cfg.includeCompanyContacted = v; saveNow(); refresh(); }),
+    ]),
+  );
+
+  mainEl.appendChild(
+    panel('确认后如何打开', '用户点「确认投递」后，按清单顺序逐个打开岗位页并点「立即沟通」。只发起沟通，不自动发消息。', [
+      setRow('前台打开页面', '关闭时在后台标签页点击（不抢焦点，但你看不到过程）', cfg.applyForeground, (v) => { cfg.applyForeground = v; saveNow(); }),
+      setRow('点完保留标签页', '关闭时进入沟通页后自动关掉标签页；开启则留着让你接着聊', cfg.applyKeepTab, (v) => { cfg.applyKeepTab = v; saveNow(); }),
+      ctlRow('投递间隔', '两个岗位之间随机等待，避免连续点击', h('span', { class: 'range' }, [
+        numInput({ value: cfg.applyGapMinSec, min: 5, max: 120, unit: '秒', width: 70, onCommit: async (v) => { cfg.applyGapMinSec = v ?? 5; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.applyGapMinSec; } }),
+        h('span', { class: 'range-sep', text: '–' }),
+        numInput({ value: cfg.applyGapMaxSec, min: 5, max: 300, unit: '秒', width: 70, onCommit: async (v) => { cfg.applyGapMaxSec = v ?? 12; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.applyGapMaxSec; } }),
+      ])),
+    ]),
+  );
+}
+
+function multiChips(options, values, onChange) {
+  const set = new Set(Array.isArray(values) ? values : []);
+  const wrap = h('div', { class: 'chip-row' });
+  const draw = () => {
+    wrap.replaceChildren(
+      ...options.map((v) =>
+        h('button', {
+          type: 'button',
+          class: 'chip chip-toggle' + (set.has(v) ? ' active' : ''),
+          'aria-pressed': set.has(v) ? 'true' : 'false',
+          text: v,
+          onclick: () => {
+            if (set.has(v)) set.delete(v);
+            else set.add(v);
+            onChange([...set]);
+            draw();
+          },
+        }),
+      ),
+    );
+  };
+  draw();
+  return wrap;
+}
+
+function statCell(label, value, tone) {
+  return h('div', { class: 'auto-stat' }, [
+    h('div', { class: 'auto-stat-n' + (tone ? ' tone-' + tone : ''), text: String(value) }),
+    h('div', { class: 'auto-stat-l', text: label }),
+  ]);
+}
+
+// ============================================================
 //  已沟通与屏蔽
 // ============================================================
 const LIST_PAGE = 50;
@@ -1157,7 +1466,7 @@ function renderLists() {
     ]),
   );
 
-  const SRC = { chat: '沟通页', greeting: '插件打招呼', manual: '手动标记' };
+  const SRC = { chat: '沟通页', greeting: '插件打招呼', manual: '手动标记', auto_apply: '自动投递' };
   async function fillContacts() {
     try {
       const r = await send(MSG.CONTACTS_GET);

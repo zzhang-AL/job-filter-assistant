@@ -11,6 +11,12 @@
       activeProviderId: 'demo',
       privacy: { redactPII: true, sendCompanyName: true, confirmBeforeSend: false },
       filters: { enabled: false, keywordsInclude: [], keywordsExclude: [], riskKeywords: ['外包','驻场','猎头'], cities: [], salaryMinK: null, salaryMaxK: null, experience: [], degrees: [], excludeCompanies: [] },
+      autoApply: {
+        enabled: true, dailyTime: '09:00', keywords: ['前端'], cityName: '广州', cityCode: '101280100',
+        scrolls: 4, experience: [], salaryMinK: null, salaryMaxK: null, hrActiveMaxTier: 3,
+        threshold: 70, dailyCollectCap: 50, dailyCap: 20, includeCompanyContacted: true,
+        applyForeground: true, applyGapMinSec: 5, applyGapMaxSec: 12, applyKeepTab: false,
+      },
     },
     providers: [
       { id: 'demo', name: 'DeepSeek 深度求索', protocol: 'openai-chat', baseUrl: 'https://api.deepseek.com/v1', apiKey: 'sk-demo', model: 'deepseek-chat', anthropicVersion: '', extraHeaders: {}, temperature: 0.3, maxTokens: 2048, discoveredModels: ['deepseek-chat','deepseek-reasoner'] },
@@ -46,6 +52,32 @@
     ctx: { platform:'boss', url:'https://www.zhipin.com/job_detail/demo1.html', jobKey:'demo1', isChat:false },
   };
 
+  // 投递清单演示数据：直接复用岗位库里有匹配分的 BOSS 岗位
+  state.applyItems = state.jobs
+    .filter((j) => j.platform === 'boss' && j.match && j.match.score >= 70)
+    .map((j) => ({
+      uid: j.uid, jobId: j.jobId, platform: j.platform, title: j.title, company: j.company,
+      salaryText: j.salaryText, city: j.city, district: j.district, experience: j.experience, degree: j.degree,
+      hrActiveText: j.hrActiveText, url: j.url, score: j.match.score, verdict: j.match.verdict,
+      summary: j.match.summary, hasGreeting: !!(j.match.greetings && j.match.greetings.standard),
+      greetingPreview: '', companyContacted: j.contacted === 'company', status: 'pending',
+      addedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }));
+
+  function mockApplyStatus() {
+    const items = state.applyItems || [];
+    const counts = { total: items.length, applying: 0, pending: 0, applied: 0, rejected: 0, failed: 0, skipped: 0 };
+    for (const it of items) if (counts[it.status] != null) counts[it.status]++;
+    return {
+      enabled: state.settings.autoApply.enabled,
+      config: state.settings.autoApply,
+      collect: { date: '2026-10-31', count: Math.min(12, state.settings.autoApply.dailyCollectCap), cap: state.settings.autoApply.dailyCollectCap },
+      search: { running: false, lastSearchDate: '2026-10-31', lastSearchAt: Date.now() - 3600000, lastSearchStatus: 'ok', lastSearchError: '', lastSearchCount: 3, nextRunAt: Date.now() + 6 * 3600000 },
+      batch: { date: '2026-10-31', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), items, counts },
+      run: { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false },
+    };
+  }
+
   // 广播给所有 onMessage 监听者（模拟真实扩展的 chrome.runtime.sendMessage 广播）
   function broadcast(msg) {
     listeners.forEach((fn) => { try { fn(msg, {}, () => {}); } catch {} });
@@ -56,7 +88,7 @@
     switch (t) {
       case 'SETTINGS_GET': return state.settings;
       case 'SETTINGS_SAVE':
-        state.settings = { ...state.settings, ...msg.patch, privacy:{...state.settings.privacy,...(msg.patch&&msg.patch.privacy)}, filters:{...state.settings.filters,...(msg.patch&&msg.patch.filters)} };
+        state.settings = { ...state.settings, ...msg.patch, privacy:{...state.settings.privacy,...(msg.patch&&msg.patch.privacy)}, filters:{...state.settings.filters,...(msg.patch&&msg.patch.filters)}, autoApply:{...state.settings.autoApply,...(msg.patch&&msg.patch.autoApply)} };
         return state.settings;
       case 'JOB_LIST_REQUEST': return state.jobs;
       case 'JOB_STAR_TOGGLE': state.jobs = state.jobs.map(j=>j.uid===msg.uid?{...j,star:!j.star}:j); return state.jobs;
@@ -89,6 +121,21 @@
       case 'GREETING_SAVE': state.jobs = state.jobs.map(j=>j.uid===msg.uid?{...j,greetingDraft:msg.text}:j); return state.jobs;
       case 'ACTIVE_CONTEXT_REQUEST': return { platform:state.ctx.platform, url:state.ctx.url, jobKey:state.ctx.jobKey, isChat:state.ctx.isChat, platformName: state.ctx.platform==='boss'?'BOSS 直聘':'前程无忧 51job' };
       case 'SEND_GREETING': console.log('[mock] SEND_GREETING:', msg.text); return { ok:true, mode:'sent' };
+      case 'AUTO_APPLY_STATUS_GET': case 'AUTO_APPLY_RUN_NOW': case 'APPLY_REFRESH':
+        return msg.type === 'AUTO_APPLY_RUN_NOW' ? { started: true } : mockApplyStatus();
+      case 'APPLY_ITEM_MARK': {
+        const ids = new Set(msg.uids || []);
+        state.applyItems = (state.applyItems || []).map((it) => ids.has(it.uid) ? { ...it, status: msg.status, updatedAt: new Date().toISOString() } : it);
+        return mockApplyStatus();
+      }
+      case 'APPLY_START': {
+        const ids = new Set(msg.uids || []);
+        state.applyItems = (state.applyItems || []).map((it) => ids.has(it.uid) && it.status === 'pending' ? { ...it, status: 'applied', appliedAt: new Date().toISOString() } : it);
+        setTimeout(() => broadcast({ type: 'APPLY_UPDATED' }), 0);
+        return { started: true, total: ids.size };
+      }
+      case 'APPLY_STOP': return { stopping: true };
+      case 'OPEN_SIDEPANEL': return { ok: true };
       case 'AI_PROVIDERS_GET': return state.providers;
       case 'AI_PROVIDERS_SAVE': state.providers = msg.providers; return state.providers;
       case 'AI_PROVIDER_TEST': return { ok:true, message:'连接成功', sample:'正常' };

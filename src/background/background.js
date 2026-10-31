@@ -9,8 +9,14 @@ import {
   loadBlocked, blockJobs, unblockJob, clearBlocked, loadContacts, addContacts, clearContacts,
   markJobsContacted, removeContacts,
 } from '../common/jobsStore.js';
-import { insertDetailTask, taskTier } from '../common/pacing.js';
-import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt, setCapBypass } from './tabWorker.js';
+import { insertDetailTask, taskTier, randInt } from '../common/pacing.js';
+import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt, setHalt, setCapBypass } from './tabWorker.js';
+import {
+  buildBossSearchUrl, dailyDue, dateKey, nextRunAt, matchSearchFilter, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
+} from '../common/autoApply.js';
+import {
+  loadApplyBatch, updateApplyBatch, loadApplyHistory, addApplyHistory, loadAutoApplyState, saveAutoApplyState, markApplyItems,
+} from '../common/applyStore.js';
 import {
   loadSettings, saveSettings, loadProviders, saveProviders, getActiveProvider,
 } from '../common/settingsStore.js';
@@ -27,12 +33,16 @@ import { redactText } from '../common/ai/privacy.js';
 
 // 记录每个 tab 当前所处平台，供 UI 查询「当前站点」
 const tabContext = new Map();
+// 自动投递打开的前台标签页：不让它们污染侧边栏的「当前岗位」
+const applyTabs = new Set();
 
 // —— 侧边栏：点击工具栏图标即打开 ——
 chrome.runtime.onInstalled.addListener(async () => {
   try {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   } catch {}
+  ensureAutoApplyAlarm().catch(() => {});
+  autoApplyTick().catch(() => {});
 });
 
 // —— 统一消息入口 ——
@@ -48,6 +58,13 @@ async function handle(msg, sender) {
   switch (msg.type) {
     // ---------- 岗位数据流 ----------
     case MSG.JOBS_CAPTURED:
+      // 搜索页可能同时回多个 joblist 响应：串行处理，避免两个响应都基于同一份旧岗位库
+      // 判定 fresh、重复占用 dailyCollectCap。普通浏览仍并行。
+      if (sender.tab && tabTaskOf(sender.tab.id).role === 'search') {
+        const run = captureChain.then(() => onJobsCaptured(msg, sender));
+        captureChain = run.catch(() => {});
+        return run;
+      }
       return onJobsCaptured(msg, sender);
     case MSG.JOB_LIST_REQUEST:
       return loadJobs();
@@ -102,6 +119,20 @@ async function handle(msg, sender) {
       return syncContacts({ force: true, windowId: msg.windowId });
     case MSG.AUTO_STATUS_GET:
       return fullAutoStatus();
+
+    // ---------- 每日自动刷 BOSS + 投递清单 ----------
+    case MSG.AUTO_APPLY_RUN_NOW:
+      return triggerDailySearch('manual');
+    case MSG.AUTO_APPLY_STATUS_GET:
+      return autoApplyStatus();
+    case MSG.APPLY_REFRESH:
+      return refreshApplyList({ notify: true, force: true }).then(() => autoApplyStatus());
+    case MSG.APPLY_ITEM_MARK:
+      return markApplyItemStatus(msg.uids, msg.status);
+    case MSG.APPLY_START:
+      return startApplyRun(msg.uids);
+    case MSG.APPLY_STOP:
+      return stopApplyRun();
     case MSG.WORKER_HALT_CLEAR:
       // 用户手动继续：除了解除熔断，本轮也不再被额度 / 时段挂起
       await setCapBypass(true);
@@ -131,7 +162,7 @@ async function handle(msg, sender) {
       }
       return { ok: true };
     case MSG.CURRENT_JOB:
-      if (sender.tab && sender.tab.id != null && !isWorkerTab(sender.tab.id)) {
+      if (sender.tab && sender.tab.id != null && !isWorkerTab(sender.tab.id) && !applyTabs.has(sender.tab.id)) {
         const prev = tabContext.get(sender.tab.id) || {};
         tabContext.set(sender.tab.id, {
           ...prev,
@@ -159,8 +190,13 @@ async function handle(msg, sender) {
     // ---------- 设置 ----------
     case MSG.SETTINGS_GET:
       return loadSettings();
-    case MSG.SETTINGS_SAVE:
-      return saveSettings(msg.patch || {});
+    case MSG.SETTINGS_SAVE: {
+      const next = await saveSettings(msg.patch || {});
+      // 自动投递的开关 / 时间改了：重排每日闹钟，并立即检查一次是否到点
+      ensureAutoApplyAlarm().catch(() => {});
+      autoApplyTick().catch(() => {});
+      return next;
+    }
 
     // ---------- 画像 ----------
     case MSG.PROFILE_GET:
@@ -206,6 +242,9 @@ async function handle(msg, sender) {
     case MSG.OPEN_OPTIONS:
       await openOptions(msg.section);
       return { ok: true };
+    case MSG.OPEN_SIDEPANEL:
+      await openSidePanel();
+      return { ok: true };
 
     default:
       throw new Error(`未知消息类型：${msg.type}`);
@@ -215,8 +254,14 @@ async function handle(msg, sender) {
 // —— 岗位收录 ——
 async function onJobsCaptured(msg, sender) {
   const settings = await loadSettings();
-  if (!settings.autoCapture) return { added: 0, updated: 0, skipped: true };
-  const jobs = normalizeResponse(msg.platform, msg.payload, { url: msg.url, jobKey: msg.jobKey });
+  // 先判断是不是每日搜索的 worker 标签：即使用户关掉了「自动收录」，
+  // 每日任务也要能收录，否则搜索会一直判 empty、清单永远出不来。
+  const role = sender.tab ? tabTaskOf(sender.tab.id).role : null;
+  const autoSearch = role === 'search';
+  // 后台任务页（详情 / 搜索 / 沟通）是插件自己打开的，不受「自动收录」开关影响；
+  // 只有用户自己浏览的页面关掉自动收录才不收录。
+  if (!settings.autoCapture && !role) return { added: 0, updated: 0, skipped: true };
+  let jobs = normalizeResponse(msg.platform, msg.payload, { url: msg.url, jobKey: msg.jobKey });
   if (!jobs.length) return { added: 0, updated: 0 };
 
   // 屏蔽名单：永远不收录；已沟通：不新增（库里已有的照常更新并打标）
@@ -229,10 +274,45 @@ async function onJobsCaptured(msg, sender) {
     if (st) j.contacted = st;
     else delete j.contacted;
   }
+
+  // 每日自动搜索打开的后台标签页：列表阶段先按用户配置的年限 / 薪资 / 城市 / HR 活跃粗筛，
+  // 避免把大量明显不合适的岗位排进详情补全和 AI 分析（省时间也省 token）。
+  const autoCfg = settings.autoApply;
+  if (autoSearch && autoCfg) {
+    const rawCount = jobs.length;
+    jobs = jobs.filter((j) => matchSearchFilter(j, autoCfg).keep);
+    searchSeen += rawCount; // 用过滤前的数量判断「有没有搜到」，避免条件过严被误报成没搜到
+    if (!jobs.length) return { added: 0, updated: 0, filtered: true };
+    // 每天自动收录数量上限：只给「库里还没有、且不会被屏蔽 / 已沟通规则跳过」的新岗位占名额；
+    // 重复出现的岗位仍更新列表字段（HR 在线 / 活跃），但不消耗当天额度。
+    const existingUids = new Set((await loadJobs()).map((j) => j.uid));
+    const fresh = [];
+    const freshSeen = new Set(existingUids);
+    for (const j of jobs) {
+      if (!j.uid || freshSeen.has(j.uid)) continue;
+      freshSeen.add(j.uid);
+      fresh.push(j);
+    }
+    // 只给「可能进入投递清单」的新岗位计收录额度：已沟通岗位 / 关闭同公司岗位的
+    // 即使因为 skipContacted=false 允许入库，也不会被匹配或投递，不能占名额。
+    const acceptable = (j) =>
+      !blocked.has(j.uid) &&
+      j.contacted !== 'job' &&
+      (autoCfg.includeCompanyContacted || j.contacted !== 'company');
+    const acceptedFresh = fresh.filter(acceptable);
+    const slots = await reserveCollectSlots(acceptedFresh.length, autoCfg);
+    if (slots < acceptedFresh.length) searchCapped = true;
+    const allowed = new Set(acceptedFresh.slice(0, slots).map((j) => j.uid));
+    jobs = jobs.filter((j) => existingUids.has(j.uid) || allowed.has(j.uid));
+    if (!jobs.length) return { added: 0, updated: 0, capped: true };
+  }
+
   const accept = (raw, prev) => {
     if (blocked.has(raw.uid)) return false;
     if (prev || !settings.skipContacted) return true;
     if (raw.contacted === 'job') return false;
+    // 每日自动搜索：按需求保留「已沟通公司的未沟通岗位」
+    if (autoSearch && autoCfg && autoCfg.includeCompanyContacted) return true;
     return !(raw.contacted === 'company' && settings.skipContactedCompanies);
   };
   const { jobs: all, added, updated, skipped, readyUids } = await mergeJobs(jobs, {
@@ -240,6 +320,7 @@ async function onJobsCaptured(msg, sender) {
     maxJobs: settings.maxJobs,
     accept,
   });
+  if (autoSearch) searchCaptured += added;
   broadcast(MSG.JOBS_UPDATED, { count: all.length, added, updated, skipped });
 
   const api = matchPlatformApi(msg.url || '', msg.platform);
@@ -253,11 +334,15 @@ async function onJobsCaptured(msg, sender) {
   // 自动进入下一步：有岗位详情就绪就去扫一遍「已就绪、未分析」的岗位接着分析
   if (settings.autoScore && readyUids.length) kickAutoScore();
   // BOSS 列表接口不含 JD 与 HR 活跃时间：在后台标签页逐个打开详情页补全。
-  // 开了自动匹配也必须补详情，否则这些岗位永远不会被自动匹配。
-  if ((settings.autoFetchDetail || settings.autoScore) && isBossList) {
-    const need = pickJobsNeedingDetail(all, jobs.map((j) => j.uid));
-    if (need.length) enqueueDetails(need, sender.tab);
+  // 每日自动搜索的岗位标记为 daily：不要求用户正停在 BOSS，也不受活跃时段限制，
+  // 否则定时任务在用户没打开招聘网站时会一直不补详情、清单永远空着。
+  if ((settings.autoFetchDetail || settings.autoScore || autoSearch) && isBossList) {
+    const need = pickJobsNeedingDetail(all, jobs.map((j) => j.uid), {
+      allowCompanyContacted: autoSearch && !!(autoCfg && autoCfg.includeCompanyContacted),
+    });
+    if (need.length) enqueueDetails(need, sender.tab, { daily: autoSearch });
   }
+  if (autoSearch || (autoCfg && autoCfg.enabled)) scheduleApplyRefresh();
   return { added, updated, skipped, total: all.length };
 }
 
@@ -274,11 +359,15 @@ let progressTab = null; // 最近一次触发补全的列表页标签：给它�
 // 队列分三档（见 pacing.insertDetailTask）：urgent 不休息、间隔较短；batch 与普通一样按人工节奏，只是排在普通前面。
 const tierOf = taskTier;
 
-function enqueueDetails(items, tab, { front = false, batch = false } = {}) {
+function enqueueDetails(items, tab, { front = false, batch = false, daily = false } = {}) {
   if (tab && tab.id != null && !isWorkerTab(tab.id)) progressTab = tab;
+  // 普通 / 每日补全排队上限：长时间挂起时不要无限堆积 URL 和任务对象；
+  // 用户主动点的 urgent / 批量任务不受此限制。
+  const MAX_DETAIL_QUEUE = 400;
   for (const it0 of items) {
     if (!it0 || !it0.url) continue;
-    const it = { ...it0, urgent: front || undefined, batch: batch || undefined };
+    if (!front && !batch && detailQueue.length >= MAX_DETAIL_QUEUE) break;
+    const it = { ...it0, urgent: front || undefined, batch: batch || undefined, daily: daily || undefined };
     // 已登记但不在队列里 = 正在处理中，不重复加
     if (detailQueued.has(it.uid) && !detailQueue.some((x) => x.uid === it.uid)) continue;
     detailQueued.add(it.uid);
@@ -574,7 +663,8 @@ async function userOnBoss() {
 }
 
 async function processDetail(it, state) {
-  if (!it.urgent && !it.batch && !(await userOnBoss())) {
+  // 每日自动搜索的补全不要求用户正停在 BOSS：定时任务通常发生在后台/别的页面。
+  if (!it.urgent && !it.batch && !it.daily && !(await userOnBoss())) {
     detailQueued.delete(it.uid);
     resolveDetailWaiters(it.uid, '');
     pushProgress();
@@ -584,6 +674,7 @@ async function processDetail(it, state) {
     timeoutMs: 30000,
     windowId: progressTab ? progressTab.windowId : undefined,
     urgent: !!it.urgent,
+    scheduled: !!it.daily,
   });
   if (res.skipped || res.haltReason) {
     // 没读成是因为被拦（熔断 / 额度 / 时段 / 登录页 / 验证页），不是这个岗位的问题：放回队列，挂起等恢复
@@ -605,6 +696,19 @@ async function processDetail(it, state) {
     if (++state.timeouts >= limit) await suspendDetails(`详情页连续 ${limit} 次加载超时（网络慢？），已暂停补全`, 10 * 60 * 1000);
   } else if (res.noJd) {
     if (++state.noJd >= 3) await suspendDetails('详情页连续 3 次读不到岗位描述（页面结构可能变了），已暂停补全', 15 * 60 * 1000);
+  }
+  if (!res.ok && !res.closed && (res.timeout || res.noJd)) {
+    // 记录逐岗位失败，autoApplyTick 不会每 10 分钟把同一批失效岗位反复打开
+    try {
+      const jobs = await loadJobs();
+      const job = jobs.find((j) => j.uid === it.uid);
+      const n = (job && job.detailFailCount ? job.detailFailCount : 0) + 1;
+      await patchJob(it.uid, {
+        detailFailCount: n,
+        detailFailAt: new Date().toISOString(),
+        detailFailError: res.timeout ? '详情页加载超时' : '详情页读不到岗位描述',
+      });
+    } catch {}
   }
   // 用户自己关掉了后台标签页（closed）等：不计入失败
   pushProgress();
@@ -643,6 +747,7 @@ async function resumeDetails() {
   await persistDetailQueue();
   pushProgress();
   if (detailQueue.length) runDetailQueue();
+  else setCapBypass(false).catch(() => {});
 }
 
 async function persistDetailQueue() {
@@ -725,11 +830,14 @@ async function markViewedOnPage(platform, jobKey) {
 }
 
 function autoCandidates(jobs, settings) {
+  // 只有开启自动投递（或正在手动跑每日搜索）时才需要分析「已沟通公司的其他岗位」
+  const allowCompany = !!(settings.autoApply && settings.autoApply.includeCompanyContacted && (settings.autoApply.enabled || searchRunning || Date.now() < dailyActiveUntil));
   return jobs.filter(
     (j) =>
       isDetailReady(j) &&
       !j.match &&
-      j.contacted !== 'job' && // 沟通过同公司的其他岗位不算，照常分析
+      j.contacted !== 'job' && // 已沟通这个岗位：不再分析
+      (allowCompany || j.contacted !== 'company') && // 已沟通公司的其他岗位按设置保留
       !j.dismissedAt && // 标了不感兴趣的不花 AI 调用；恢复后会重新进入候选
       (j.autoScoreFails || 0) < AUTO_MAX_FAILS &&
       !inActiveBatch(j.uid) && // 正在批量分析里的交给批量，避免同一岗位分析两次
@@ -837,9 +945,23 @@ async function ensureDetail(job) {
   const halt = await getHalt();
   if (halt && !isLoginHalt(halt)) return; // 「未登录」不拦：插队任务是 urgent，会打开一次重试
   await new Promise((resolve) => {
-    const timer = setTimeout(resolve, 60000);
+    let done = false;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const list = detailWaiters.get(job.uid);
+      if (list) {
+        const i = list.indexOf(finish);
+        if (i >= 0) list.splice(i, 1);
+        if (!list.length) detailWaiters.delete(job.uid);
+      }
+      resolve();
+    };
+    timer = setTimeout(finish, 60000);
     const list = detailWaiters.get(job.uid) || [];
-    list.push(() => { clearTimeout(timer); resolve(); });
+    list.push(finish);
     detailWaiters.set(job.uid, list);
     enqueueDetails([{ uid: job.uid, jobId: job.jobId, url }], null, { front: true });
   });
@@ -876,6 +998,738 @@ function pushProgress() {
     .catch(() => {});
 }
 
+// ============ 每日自动刷 BOSS + 投递清单 ============
+// 流程：定时在后台打开 BOSS 搜索页 → 页面自己加载 / 滚动列表（sniffer 收录）→ 后台补详情 → AI 匹配
+//      → 生成今日清单 → 用户在侧边栏确认 → 逐个打开岗位页点「立即沟通」。
+// 插件仍然不直接请求平台接口；搜索页的列表由页面自己发请求，插件只读结果。
+const AUTO_APPLY_TICK = 'jh-auto-apply-tick';
+const AUTO_APPLY_ALARM = 'jh-auto-apply-daily';
+const SEARCH_TIMEOUT_MS = 150000;
+let searchRunning = false;
+let searchCaptured = 0;
+let searchSeen = 0;
+let searchCapped = false;
+let collectReserveChain = Promise.resolve();
+let captureChain = Promise.resolve();
+let dailyActiveUntil = 0; // 手动跑每日搜索后的一段时间内，已沟通公司的岗位也要参与匹配
+let refreshRunning = false;
+let refreshQueued = false;
+let refreshQueuedForce = false;
+let applyRun = null; // { state, total, done, failed, current, startedAt, finishedAt, error, stopRequested }
+let applyStarting = false;
+let applyStopRequested = false;
+
+function publicApplyRun() {
+  return applyRun
+    ? { ...applyRun }
+    : { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false };
+}
+
+// 预留当天的「自动收录」名额。多个 joblist 响应可能几乎同时到达，用一条 Promise 链串行化，
+// 避免两个响应同时读到旧计数、一起突破上限。
+function reserveCollectSlots(n, cfg) {
+  const run = collectReserveChain.then(async () => {
+    const st = await loadAutoApplyState();
+    const take = Math.min(Math.max(0, Number(n) || 0), collectQuota(cfg, st));
+    if (take > 0) {
+      const today = dateKey();
+      const used = st.collectDate === today ? Math.max(0, Number(st.collected) || 0) : 0;
+      await saveAutoApplyState({ collectDate: today, collected: used + take });
+    }
+    return take;
+  });
+  collectReserveChain = run.catch(() => {});
+  return run;
+}
+
+async function autoApplyStatus() {
+  const [settings, state, batch] = await Promise.all([loadSettings(), loadAutoApplyState(), loadApplyBatch()]);
+  const cfg = settings.autoApply;
+  const items = Array.isArray(batch.items) ? batch.items : [];
+  return {
+    enabled: cfg.enabled,
+    config: {
+      dailyTime: cfg.dailyTime,
+      keywords: cfg.keywords,
+      cityName: cfg.cityName,
+      threshold: cfg.threshold,
+      dailyCollectCap: cfg.dailyCollectCap,
+      dailyCap: cfg.dailyCap,
+      includeCompanyContacted: cfg.includeCompanyContacted,
+      applyForeground: cfg.applyForeground,
+    },
+    collect: {
+      date: state.collectDate || '',
+      count: state.collectDate === dateKey() ? Math.max(0, Number(state.collected) || 0) : 0,
+      cap: cfg.dailyCollectCap,
+    },
+    search: {
+      running: searchRunning,
+      lastSearchDate: state.lastSearchDate || '',
+      lastSearchAt: state.lastSearchAt || 0,
+      lastSearchStatus: state.lastSearchStatus || '',
+      lastSearchError: state.lastSearchError || '',
+      lastSearchCount: state.lastSearchCount || 0,
+      nextRunAt: cfg.enabled && cfg.keywords.length ? nextRunAt(cfg.dailyTime) : 0,
+    },
+    batch: {
+      date: batch.date || '',
+      createdAt: batch.createdAt || '',
+      updatedAt: batch.updatedAt || '',
+      items,
+      counts: countApply(items),
+    },
+    run: publicApplyRun(),
+  };
+}
+
+// 重新生成清单：只追加新候选，保留用户已确认 / 已关闭 / 已投递的状态。
+// 同时把已经不成立的条目（岗位被删、已在别处沟通、标了不感兴趣）标成跳过。
+async function refreshApplyList({ notify = false, force = false, sinceMs = 0 } = {}) {
+  if (refreshRunning) {
+    refreshQueued = true;
+    refreshQueuedForce = refreshQueuedForce || force;
+    return null;
+  }
+  refreshRunning = true;
+  try {
+    const [settings, state] = await Promise.all([loadSettings(), loadAutoApplyState()]);
+    const cfg = settings.autoApply;
+    const today = dateKey();
+    // 用户手动跑过一次搜索后，即使没开启「每日自动搜索」，当天的后续匹配也要能继续补进清单
+    const activeToday = state.lastSearchDate === today || state.collectDate === today;
+    if (!cfg.enabled && !force && !activeToday) {
+      await updateActionBadge();
+      return null;
+    }
+    // 只有真正要生成清单时才读岗位库 / 历史 / 屏蔽名单，关闭自动投递时刷新几乎零开销
+    const [jobs, history, blocked] = await Promise.all([loadJobs(), loadApplyHistory(), loadBlocked()]);
+    const blockedSet = new Set((blocked || []).map((b) => b.uid));
+    const cur = await loadApplyBatch();
+    // 投递跨过午夜时不要滚动到新清单：否则后台标记结果找不到旧条目，当天状态会丢
+    const dayKey = applyRun && applyRun.state === 'running' && cur.date ? cur.date : today;
+    // 只有和当前清单同一天时才把已有条目算进每日名额；跨天时只把「投递中」的条目带进新一天
+    const existingForPick = cur.date && cur.date === dayKey
+      ? cur.items
+      : (cur.items || []).filter((it) => it.status === 'applying');
+    // 每日清单只从「今天出现过」的岗位里选，避免历史岗位库在当天搜索完成前
+    // 就把名额占满，导致今天新收录 / 新匹配的岗位进不来。
+    const pool = jobs.filter((j) => {
+      const d = new Date(j.lastSeenAt || '');
+      if (isNaN(d.getTime())) return false;
+      return dateKey(d) === dayKey || (sinceMs > 0 && d.getTime() >= sinceMs);
+    });
+    const cands = pickApplyCandidates(pool, cfg, { existing: existingForPick, history });
+    let added = 0;
+    const next = await updateApplyBatch((batch) => {
+      const merged = mergeApplyBatch(batch, cands, { dateKey: dayKey });
+      const reconciled = reconcileApplyBatch(merged.batch, jobs, history, cfg, blockedSet);
+      // 没有新条目、也没有状态变化时不要整份写回 storage：tick / 每次岗位广播都会走到这里
+      if (sameApplyBatch(batch, reconciled)) return null;
+      added = merged.added;
+      return reconciled;
+    });
+    if (notify && added) broadcast(MSG.APPLY_UPDATED, { added, pending: countApply(next.items).pending });
+    await updateActionBadge();
+    return next;
+  } finally {
+    refreshRunning = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      const f = refreshQueuedForce;
+      refreshQueuedForce = false;
+      setTimeout(() => refreshApplyList({ notify, force: f }).catch(() => {}), 500);
+    }
+  }
+}
+
+function sameApplyBatch(a, b) {
+  if (!a || !b || a.date !== b.date) return false;
+  const ai = a.items || [];
+  const bi = b.items || [];
+  if (ai.length !== bi.length) return false;
+  for (let i = 0; i < ai.length; i++) {
+    const x = ai[i];
+    const y = bi[i];
+    if (
+      x.uid !== y.uid ||
+      x.status !== y.status ||
+      x.score !== y.score ||
+      x.note !== y.note ||
+      x.appliedAt !== y.appliedAt ||
+      x.updatedAt !== y.updatedAt
+    ) return false;
+  }
+  return true;
+}
+
+function reconcileApplyBatch(batch, jobs, history, cfg, blockedSet) {
+  const byUid = new Map((jobs || []).map((j) => [j.uid, j]));
+  const now = Date.now();
+  const STALE_MS = 5 * 60 * 1000;
+  const items = (batch.items || []).map((it) => {
+    // 用户明确屏蔽的岗位：即使岗位库已经移除了它，也不能再投
+    if (blockedSet && blockedSet.has(it.uid)) return { ...it, status: 'skipped', note: '已屏蔽' };
+    // 上一次投递中途被浏览器 / Service Worker 终止：超过 5 分钟仍停在「投递中」就允许重试
+    if (it.status === 'applying') {
+      const t = Date.parse(it.updatedAt || it.addedAt || '');
+      if (!t || now - t > STALE_MS) return { ...it, status: 'failed', note: '上次投递被中断（浏览器或后台被关闭）' };
+      return it;
+    }
+    if (it.status !== 'pending' && it.status !== 'failed') return it;
+    const j = byUid.get(it.uid);
+    // 岗位被 maxJobs 淘汰，但清单里有链接：保留待确认，applyOne 会用快照继续投
+    if (!j) return it.url ? it : { ...it, status: 'skipped', note: '岗位已不在岗位库且缺少链接' };
+    if (history && history[it.uid]) return { ...it, status: 'skipped', note: '历史已投递过' };
+    if (j.contacted === 'job') return { ...it, status: 'skipped', note: '已在别处沟通过' };
+    if (j.contacted === 'company' && cfg && !cfg.includeCompanyContacted) {
+      return { ...it, status: 'skipped', note: '已关闭「同公司其他岗位」' };
+    }
+    if (j.dismissedAt) return { ...it, status: 'skipped', note: '已标为不感兴趣' };
+    return it;
+  });
+  return { ...batch, items };
+}
+
+// 收录 / 补详情 / 匹配完成后都排一次刷新（防抖，避免每个岗位都重算）
+const scheduleApplyRefresh = debounce(() => {
+  refreshApplyList({ notify: true }).catch(() => {});
+}, 3000);
+
+// 每天定时检查：到点、今天没跑过、且不是错过太久（浏览器整天没开时不在深夜补跑）
+async function autoApplyTick() {
+  try {
+    const [settings, state] = await Promise.all([loadSettings(), loadAutoApplyState()]);
+    const cfg = settings.autoApply;
+    const today = dateKey();
+    // 没开启每日自动搜索，但今天手动跑过一次：仍要继续补详情 / 刷新清单，直到这一轮跑完
+    const activeToday = state.lastSearchDate === today || state.collectDate === today;
+    if (!cfg.enabled && !activeToday) return;
+    if (!cfg.keywords.length) {
+      await saveAutoApplyState({ lastSearchStatus: 'error', lastSearchError: '未配置岗位关键词（设置 → 自动投递）' });
+      return;
+    }
+    if (!settings.autoScore) {
+      await saveAutoApplyState({ lastSearchStatus: 'error', lastSearchError: '自动 AI 分析未开启（设置 → 自动化）' });
+      return;
+    }
+    const due = dailyDue(cfg, state);
+    // 搜索超时 / 读取失败：当天按 10/20/40 分钟退避重试，避免一次网络抖动锁死整天
+    const retryReady = !due.due
+      && state.lastSearchDate === today
+      && state.lastSearchStatus === 'error'
+      && Number(state.searchRetryAt || 0) > 0
+      && Date.now() >= Number(state.searchRetryAt)
+      && Number(state.searchRetryCount || 0) < 3;
+    if (due.due || retryReady) {
+      try {
+        await triggerDailySearch(retryReady ? 'retry' : 'schedule');
+      } catch (e) {
+        await saveAutoApplyState({
+          lastSearchStatus: 'error',
+          lastSearchError: e instanceof Error ? e.message : String(e),
+        });
+      }
+    } else if (due.missed && state.lastSearchDate !== dateKey()) {
+      await saveAutoApplyState({
+        lastSearchDate: dateKey(),
+        lastSearchAt: Date.now(),
+        lastSearchStatus: 'missed',
+        lastSearchError: '已错过今天的运行时间（Chrome 当时没有运行）',
+      });
+      broadcast(MSG.APPLY_UPDATED, {});
+    }
+    // 兜底补详情：Service Worker 被回收后内存队列会丢，这里把「今天新收录、还没详情」的
+    // BOSS 岗位重新排进去，保证每日清单不会因为一次回收就永久缺岗位。
+    try {
+      const jobs = await loadJobs();
+      const today = dateKey();
+      const seenToday = (j) => {
+        const d = new Date(j.lastSeenAt || '');
+        return !isNaN(d.getTime()) && dateKey(d) === today;
+      };
+      const needUids = jobs
+        .filter((j) => j.platform === 'boss' && !isDetailReady(j) && seenToday(j))
+        .filter((j) => (j.detailFailCount || 0) < 3)
+        .filter((j) => !j.detailFailAt || Date.now() - Date.parse(j.detailFailAt) > 6 * 3600 * 1000)
+        .filter((j) => matchSearchFilter(j, cfg).keep)
+        .slice(0, 80)
+        .map((j) => j.uid);
+      if (needUids.length) {
+        const need = pickJobsNeedingDetail(jobs, needUids, { allowCompanyContacted: !!cfg.includeCompanyContacted });
+        if (need.length) enqueueDetails(need, null, { daily: true });
+      }
+    } catch {}
+    await refreshApplyList({ notify: true });
+    await updateActionBadge();
+  } catch {}
+}
+
+async function ensureAutoApplyAlarm() {
+  try {
+    const settings = await loadSettings();
+    if (!settings.autoApply.enabled) {
+      await chrome.alarms.clear(AUTO_APPLY_ALARM);
+      return;
+    }
+    const at = nextRunAt(settings.autoApply.dailyTime);
+    if (at) await chrome.alarms.create(AUTO_APPLY_ALARM, { when: at });
+  } catch {}
+}
+
+// UI / 定时器触发一次搜索。立即返回，真正的搜索在后台跑（避免侧边栏 send 超时）。
+async function triggerDailySearch(trigger = 'manual') {
+  if (searchRunning) return { started: false, running: true };
+  // 先占位再 await：alarm 与 10 分钟 tick 可能在同一分钟同时进来
+  searchRunning = true;
+  let cfg;
+  try {
+    const settings = await loadSettings();
+    cfg = settings.autoApply;
+    if (!cfg.keywords.length) throw new Error('请先在设置 → 自动投递里填写岗位关键词');
+    if (!settings.autoScore) throw new Error('自动投递需要先开启「自动 AI 分析」（设置 → 自动化）');
+    const provider = await getActiveProvider();
+    if (!provider) throw new Error('尚未配置 AI 供应商，请先到设置页添加');
+  } catch (e) {
+    searchRunning = false;
+    throw e;
+  }
+  if (trigger !== 'retry') await saveAutoApplyState({ searchRetryAt: 0, searchRetryCount: 0 });
+  dailyActiveUntil = Date.now() + 6 * 3600 * 1000;
+  searchCaptured = 0;
+  searchSeen = 0;
+  searchCapped = false;
+  broadcast(MSG.APPLY_UPDATED, { searchStarted: true, trigger });
+  updateActionBadge();
+  runDailySearchNow(cfg)
+    .catch((e) => {
+      saveAutoApplyState({
+        lastSearchAt: Date.now(),
+        lastSearchStatus: 'error',
+        lastSearchError: e instanceof Error ? e.message : String(e),
+      }).catch(() => {});
+    })
+    .finally(async () => {
+      searchRunning = false;
+      await ensureAutoApplyAlarm();
+      broadcast(MSG.APPLY_UPDATED, { searchFinished: true });
+      updateActionBadge();
+    });
+  return { started: true };
+}
+
+async function runDailySearchNow(cfg) {
+  const runDay = dateKey(); // 搜索跨过午夜时，仍算作「发起那天」这次每日任务
+  const runStartedAt = Date.now();
+  const errors = [];
+  let halted = false;
+  // 搜索前先同步一次沟通记录：确保「已沟通岗位」不会被推荐。
+  // 用 scheduled 让沟通页同步也不受活跃时段限制；失败不影响搜索本身。
+  try {
+    await syncContacts({ force: true, scheduled: true });
+  } catch {}
+  for (const keyword of cfg.keywords) {
+    const res = await runInBackgroundTab(buildBossSearchUrl(cfg, keyword), 'search', {
+      timeoutMs: SEARCH_TIMEOUT_MS,
+      scheduled: true,
+      scrolls: cfg.scrolls,
+      ignoreCaps: true, // 一天的几次搜索不应被补详情额度耗尽而跳过
+    });
+    if (res.skipped || res.haltReason) {
+      halted = true;
+      errors.push(res.skipped || res.haltReason);
+      break;
+    }
+    if (!res.ok) {
+      errors.push(res.error || (res.timeout ? `搜索「${keyword}」加载超时` : `搜索「${keyword}」读取失败`));
+    }
+  }
+  // 等收录合并 / 详情入队落盘（sniffer 消息可能比搜索页回报晚一点到）
+  if (!errors.length) await sleep(2000);
+  const empty = !errors.length && searchSeen === 0;
+  const prev = await loadAutoApplyState();
+  const failed = !!errors.length && !halted;
+  const retryCount = failed ? Math.min(3, Number(prev.searchRetryCount || 0) + 1) : 0;
+  const retryAt = failed && retryCount < 3 ? Date.now() + 10 * 60 * 1000 * Math.pow(2, retryCount - 1) : 0;
+  await saveAutoApplyState({
+    // 未登录 / 验证页属于临时熔断：保留当天原状态（可能已经成功跑过），
+    // 只在还没跑过时保持空日期，熔断解除后下一轮 tick 自动重试
+    lastSearchDate: halted ? prev.lastSearchDate || '' : runDay,
+    lastSearchAt: Date.now(),
+    lastSearchStatus: errors.length ? 'error' : empty ? 'empty' : searchCapped ? 'capped' : 'ok',
+    lastSearchError: errors.length
+      ? errors.join('；')
+      : empty
+        ? '没有搜到新岗位（可能都已收录 / 已沟通，或筛选条件过严）'
+        : searchCapped
+          ? '今日自动收录已达上限，剩余岗位明天再收；可在设置里调高「每日最多收录」'
+          : '',
+    lastSearchCount: searchCaptured,
+    searchRetryAt: retryAt,
+    searchRetryCount: retryCount,
+  });
+  // 搜索跨午夜时，午夜前收录的岗位 lastSeenAt 是昨天，也要纳入这一轮清单
+  await refreshApplyList({ notify: true, force: true, sinceMs: runStartedAt });
+}
+
+// 用户在清单里确认 / 忽略
+async function markApplyItemStatus(uids, status) {
+  if (!['pending', 'rejected'].includes(status)) throw new Error('不支持的清单状态');
+  const list = Array.isArray(uids) ? uids : [uids];
+  if (!list.length) return autoApplyStatus();
+  await markApplyItems(list, { status, reviewedAt: new Date().toISOString() });
+  // 「不想要」是持久偏好：同时标成岗位库里的「不感兴趣」，以后搜索 / 匹配 / 清单都不会再推；
+  // 用户仍可在岗位库的「不感兴趣」分组里恢复。
+  if (status === 'rejected') {
+    try {
+      afterJobsChange(await markJobs(list, { dismissed: true }));
+    } catch {}
+  }
+  broadcast(MSG.APPLY_UPDATED, {});
+  await updateActionBadge();
+  return autoApplyStatus();
+}
+
+// 用户确认后开始逐个打开岗位页并点「立即沟通」。立即返回，进度通过广播 / 轮询给 UI。
+async function startApplyRun(uids) {
+  if (applyStarting || (applyRun && applyRun.state === 'running')) throw new Error('投递正在进行中');
+  // 先同步占位，避免两个确认请求在 loadApplyBatch 的 await 窗口里同时通过检查
+  applyStarting = true;
+  try {
+    const batch = await loadApplyBatch();
+    const wanted = new Set((Array.isArray(uids) ? uids : [uids]).filter(Boolean));
+    if (!wanted.size) throw new Error('未选择要投递的岗位');
+    const items = batch.items.filter((it) => it.status === 'pending' && wanted.has(it.uid));
+    if (!items.length) throw new Error('没有待确认的岗位');
+    applyStopRequested = false;
+    applyRun = {
+      state: 'running',
+      total: items.length,
+      done: 0,
+      failed: 0,
+      current: '',
+      startedAt: Date.now(),
+      finishedAt: 0,
+      error: '',
+      stopRequested: false,
+    };
+    broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+    runApplyQueue(items).catch(() => {});
+    return { started: true, total: items.length };
+  } finally {
+    applyStarting = false;
+  }
+}
+
+function stopApplyRun() {
+  applyStopRequested = true;
+  if (applyRun) {
+    applyRun.stopRequested = true;
+    broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+  }
+  return { stopping: true, run: publicApplyRun() };
+}
+
+async function runApplyQueue(items) {
+  let cfg = null;
+  let consecutiveFails = 0;
+  const keepAliveTimer = setInterval(() => chrome.runtime.getPlatformInfo().catch(() => {}), 20000);
+  try {
+    const settings = await loadSettings();
+    cfg = settings.autoApply;
+    for (const it of items) {
+      if (applyStopRequested) break;
+      const halt = await getHalt();
+      if (halt) {
+        applyRun.error = halt.reason;
+        break;
+      }
+      // 用户可能在投递过程中把后面的岗位关掉 / 屏蔽：执行前再读一次最新状态，别把已关闭的再投出去
+      const latest = (await loadApplyBatch()).items.find((x) => x.uid === it.uid);
+      if (!latest || latest.status !== 'pending') {
+        applyRun.done++;
+        continue;
+      }
+      applyRun.current = it.uid;
+      broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+      // 先落「投递中」：SW 中途被回收时，重启后不会把它当 pending 再点一次
+      await markApplyItems([it.uid], { status: 'applying' });
+      const res = await applyOne(it, cfg);
+      if (res.skipped) {
+        applyRun.done++;
+        consecutiveFails = 0;
+        await markApplyItems([it.uid], { status: 'skipped', note: res.reason || '' });
+      } else if (res.ok) {
+        applyRun.done++;
+        consecutiveFails = 0;
+        await markApplyItems([it.uid], { status: 'applied', appliedAt: new Date().toISOString(), note: '' });
+      } else {
+        applyRun.failed++;
+        consecutiveFails++;
+        await markApplyItems([it.uid], { status: 'failed', note: res.error || '' });
+      }
+      broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+      if (res.blocked) {
+        applyRun.error = res.error || 'BOSS 触发安全验证，已停止投递';
+        break;
+      }
+      if (consecutiveFails >= 3) {
+        applyRun.error = `连续 ${consecutiveFails} 次投递失败，已停止；请检查登录状态和页面结构`;
+        break;
+      }
+      await sleep(randInt(cfg.applyGapMinSec, cfg.applyGapMaxSec) * 1000);
+    }
+  } catch (e) {
+    if (applyRun) applyRun.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    clearInterval(keepAliveTimer);
+    applyRun.state = applyStopRequested ? 'stopped' : applyRun.error ? 'error' : 'done';
+    applyRun.current = '';
+    applyRun.finishedAt = Date.now();
+    broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+    await refreshApplyList({ notify: true });
+    await updateActionBadge();
+  }
+}
+
+// 记录一次「已沟通」：岗位标记 + 沟通记录 + 历史已投。任何一步失败都不影响
+// 已经发生的点击，避免因为写库异常把已沟通的岗位留到明天重复投。
+async function recordAppliedJob(job) {
+  const now = new Date().toISOString();
+  try {
+    await patchJob(job.uid, { appliedAt: now, appliedSource: 'auto_apply' });
+  } catch {}
+  try {
+    const { jobs: list } = await addContacts(
+      [{ jobId: job.jobId, title: job.title, company: job.company, hrName: job.hrName }],
+      'auto_apply',
+    );
+    if (list) afterJobsChange(list);
+  } catch {}
+  try {
+    await addApplyHistory([{ uid: job.uid, title: job.title, company: job.company, at: now }]);
+  } catch {}
+}
+
+// 单个岗位：打开详情页 → content-script 点「立即沟通」→ 等页面进入聊天页 → 记为已沟通。
+// 只发起沟通，不自动发送任何消息；招呼语只在有草稿时预填。
+async function applyOne(item, cfg) {
+  const [jobs, blocked] = await Promise.all([loadJobs(), loadBlocked()]);
+  if ((blocked || []).some((b) => b.uid === item.uid)) return { ok: true, skipped: true, reason: '已屏蔽' };
+  const stored = jobs.find((j) => j.uid === item.uid);
+  // 岗位可能已被岗位库容量策略淘汰，但用户已经确认过这条清单：用快照里的链接继续投
+  const job = stored || {
+    uid: item.uid,
+    jobId: item.jobId,
+    title: item.title,
+    company: item.company,
+    url: item.url,
+    hrName: '',
+    match: null,
+    greetingDraft: '',
+  };
+  if (!job.url) return { ok: false, skipped: true, reason: '岗位缺少链接' };
+  if (stored && stored.contacted === 'job') return { ok: true, skipped: true, reason: '已沟通' };
+  if (stored && stored.contacted === 'company' && !cfg.includeCompanyContacted) {
+    return { ok: true, skipped: true, reason: '已关闭同公司其他岗位' };
+  }
+  if (stored && stored.dismissedAt) return { ok: true, skipped: true, reason: '已标为不感兴趣' };
+  if (item.companyContacted && !cfg.includeCompanyContacted) {
+    return { ok: true, skipped: true, reason: '已关闭同公司其他岗位' };
+  }
+  if (stored && stored.appliedAt) return { ok: true, skipped: true, reason: '已投递过' };
+  let tab = null;
+  let chatTabId = 0;
+  try {
+    tab = await chrome.tabs.create({ url: job.url, active: !!cfg.applyForeground });
+    if (tab && tab.id != null) applyTabs.add(tab.id);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  try {
+    await waitTabComplete(tab.id, 20000).catch(() => {}); // 加载慢也先尝试发消息
+    // 自动投递只点「立即沟通」，不预填招呼语：聊天页可能自动选中上一个会话，
+    // 预填很容易填给错误的 HR。招呼语仍可在手动「打招呼」里使用。
+    const res = await sendMessageWithRetry(tab.id, { type: MSG.APPLY_CLICK, jobId: job.jobId, text: '' }, 8, 700);
+    if (res && res.blocked) {
+      const why = res.blocked === 'login' ? 'BOSS 未登录，自动投递已暂停' : 'BOSS 触发安全验证，自动投递暂停 30 分钟';
+      await setHalt(why, res.blocked === 'login' ? 10 * 60 * 1000 : 30 * 60 * 1000, res.blocked);
+      return { ok: false, blocked: true, error: why };
+    }
+    if (!res || !res.ok) return { ok: false, error: (res && res.error) || '页面没有响应' };
+    if (res.mode === 'already') {
+      // 页面显示「继续沟通」：说明已经在别处沟通过（可能是手动聊过、同步漏了）。
+      // 也要写入沟通记录 / 历史，否则明天还会被当成未沟通岗位重新推荐。
+      await recordAppliedJob(job);
+      return { ok: true, already: true };
+    }
+
+    let confirmed = res.mode === 'chat';
+    if (res.mode === 'clicked') {
+      const nav = await waitForChatTab(tab.id, 8000, job);
+      if (nav.blocked) {
+        const why = nav.blocked === 'login' ? 'BOSS 未登录，自动投递已暂停' : 'BOSS 触发安全验证，自动投递暂停 30 分钟';
+        await setHalt(why, nav.blocked === 'login' ? 10 * 60 * 1000 : 30 * 60 * 1000, nav.blocked);
+        return { ok: false, blocked: true, error: why };
+      }
+      if (nav.unconfirmed) return { ok: false, unconfirmed: true, error: nav.error || '已进入聊天页，但无法确认是目标岗位的会话' };
+      confirmed = nav.ok;
+      chatTabId = nav.newTabId || 0;
+      if (chatTabId) applyTabs.add(chatTabId);
+      if (!confirmed) return { ok: false, error: '已点击「立即沟通」，但没有进入沟通页（可能被拦截或按钮失效）' };
+    }
+    if (!confirmed) return { ok: false, error: '未确认进入沟通页' };
+
+    await recordAppliedJob(job);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  } finally {
+    if (tab) {
+      applyTabs.delete(tab.id);
+      if (!cfg.applyKeepTab) setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 2000);
+    }
+    if (chatTabId && !cfg.applyKeepTab) {
+      setTimeout(() => { applyTabs.delete(chatTabId); chrome.tabs.remove(chatTabId).catch(() => {}); }, 2500);
+    }
+  }
+}
+
+// 点「立即沟通」后 BOSS 会整页跳到聊天页；轮询标签页 URL 确认，顺便识别登录 / 验证页。
+// 少数情况下 BOSS 会新开标签页，这时用 openerTabId 认领新标签，避免误判成失败再点一次。
+async function verifyChatSession(tabId, job) {
+  try {
+    const r = await sendMessageWithRetry(tabId, {
+      type: MSG.CHAT_VERIFY,
+      jobId: job ? job.jobId : '',
+      company: job ? job.company : '',
+    }, 3, 500);
+    if (r && r.ok) return r.matched === true ? true : r.matched === false ? false : null;
+  } catch {}
+  return null;
+}
+
+async function waitForChatTab(tabId, timeoutMs, job) {
+  return new Promise((resolve) => {
+    let done = false;
+    let pollTimer = null;
+    let deadlineTimer = null;
+    let newTabId = 0; // BOSS 少数情况下会新开聊天天标签页
+    let verifying = false;
+    const cleanups = [];
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearInterval(pollTimer);
+      clearTimeout(deadlineTimer);
+      for (const fn of cleanups) { try { fn(); } catch {} }
+      resolve(result);
+    };
+    const checkTab = async (id = tabId) => {
+      let tab;
+      try {
+        tab = await chrome.tabs.get(id);
+      } catch {
+        if (id === tabId) finish({ ok: false, error: '标签页已关闭' });
+        return;
+      }
+      const url = tab.url || '';
+      if (/\/web\/geek\/chat/.test(url)) {
+        if (verifying) return;
+        verifying = true;
+        const matched = await verifyChatSession(id, job);
+        verifying = false;
+        if (done) return;
+        if (matched === true) { finish({ ok: true, ...(id !== tabId ? { newTabId: id } : {}) }); return; }
+        if (matched === false) {
+          finish({ ok: false, unconfirmed: true, error: '已进入聊天页，但会话与目标岗位不一致' });
+          return;
+        }
+        // content 无法确认时，只有 URL 带明确 jobId 且与目标一致才认成功
+        const sid = (url.match(/[?&#](?:jobId|id|encryptJobId)=([\w~-]+)/) || [])[1];
+        if (sid && job && job.jobId && sid === String(job.jobId)) {
+          finish({ ok: true, ...(id !== tabId ? { newTabId: id } : {}) });
+          return;
+        }
+        finish({ ok: false, unconfirmed: true, error: '已进入聊天页，但无法确认是目标岗位的会话' });
+        return;
+      }
+      if (/\/web\/user\/(safe|verify)|security-check|verify-slider|\/web\/passport/.test(url)) {
+        finish({ ok: false, blocked: 'verify' });
+        return;
+      }
+      try {
+        if (/^\/web\/user\/?$/.test(new URL(url).pathname)) finish({ ok: false, blocked: 'login' });
+      } catch {}
+    };
+    // 用 onUpdated 替代每 400ms 查询所有标签页；轮询只针对当前一个 tab，开销小得多
+    const onUpdated = (id) => {
+      if (id === tabId) checkTab(tabId);
+      else if (newTabId && id === newTabId) checkTab(newTabId);
+    };
+    const onCreated = (tab) => {
+      if (tab.openerTabId !== tabId || tab.id == null) return;
+      newTabId = tab.id;
+      setTimeout(() => { if (!done && newTabId) checkTab(newTabId); }, 400);
+    };
+    const onRemoved = (id) => {
+      if (id === tabId) finish({ ok: false, error: '标签页已关闭' });
+      else if (id === newTabId) newTabId = 0;
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onCreated.addListener(onCreated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    cleanups.push(
+      () => chrome.tabs.onUpdated.removeListener(onUpdated),
+      () => chrome.tabs.onCreated.removeListener(onCreated),
+      () => chrome.tabs.onRemoved.removeListener(onRemoved),
+    );
+    pollTimer = setInterval(() => {
+      checkTab(tabId);
+      if (newTabId) checkTab(newTabId);
+    }, 1200);
+    deadlineTimer = setTimeout(() => finish({ ok: false, timeout: true }), timeoutMs);
+    checkTab(tabId);
+  });
+}
+
+async function updateActionBadge() {
+  try {
+    const batch = await loadApplyBatch();
+    const today = dateKey();
+    const pending = batch.date === today ? batch.items.filter((it) => it.status === 'pending').length : 0;
+    const running = searchRunning || (applyRun && applyRun.state === 'running');
+    const text = running ? '…' : pending ? String(Math.min(pending, 99)) : '';
+    await chrome.action.setBadgeText({ text });
+    await chrome.action.setBadgeBackgroundColor({ color: running ? '#ff9f0a' : '#00a6a7' });
+    await chrome.action.setTitle({ title: pending ? `岗位筛选助手 · ${pending} 个待确认投递` : '岗位筛选助手' });
+  } catch {}
+}
+
+// 每 10 分钟兜底：补跑错过的定时搜索 + 把新完成的匹配补进今日清单 + 更新角标
+try {
+  chrome.alarms.create(AUTO_APPLY_TICK, { periodInMinutes: 10 });
+  chrome.alarms.onAlarm.addListener((a) => {
+    if (a.name === AUTO_APPLY_TICK) autoApplyTick().catch(() => {});
+    else if (a.name === AUTO_APPLY_ALARM) triggerDailySearch('alarm').catch(() => {});
+  });
+} catch {}
+setTimeout(() => {
+  ensureAutoApplyAlarm().catch(() => {});
+  autoApplyTick().catch(() => {});
+}, 5000);
+
+async function openSidePanel() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tab && tab.windowId != null) {
+      await chrome.sidePanel.open({ windowId: tab.windowId });
+      return;
+    }
+  } catch {}
+  await chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html') });
+}
+
 // ============ 已沟通记录 ============
 const CONTACTS_SYNC_KEY = 'jobHelperContactsSyncAtV1';
 const CONTACTS_SYNC_NEXT_KEY = 'jobHelperContactsNextSyncV1';
@@ -894,7 +1748,7 @@ async function onContactsCaptured(msg) {
 }
 
 // 后台打开沟通页，让页面自己加载会话列表，由 content-script 嗅探读取后关闭
-function syncContacts({ force = false, windowId } = {}) {
+function syncContacts({ force = false, windowId, scheduled = false } = {}) {
   if (contactsSyncing) return contactsSyncing;
   contactsSyncing = (async () => {
     const got = await chrome.storage.local.get(CONTACTS_SYNC_NEXT_KEY);
@@ -902,7 +1756,7 @@ function syncContacts({ force = false, windowId } = {}) {
     if (!force && Date.now() < nextAt) return contactsOverview();
     // 先记时间：失败也不在下个周期内反复重试
     await chrome.storage.local.set({ [CONTACTS_SYNC_KEY]: Date.now(), [CONTACTS_SYNC_NEXT_KEY]: Date.now() + nextSyncDelayMs() });
-    const res = await runInBackgroundTab(BOSS_CHAT_URL, 'contacts', { timeoutMs: 30000, windowId, urgent: force });
+    const res = await runInBackgroundTab(BOSS_CHAT_URL, 'contacts', { timeoutMs: 30000, windowId, urgent: force, scheduled });
     const overview = await contactsOverview();
     if (!res.ok) overview.error = res.skipped || res.haltReason || (res.timeout ? '沟通页加载超时' : '沟通页读取失败');
     return overview;
@@ -946,6 +1800,8 @@ async function openOptions(section) {
 
 function afterJobsChange(list) {
   broadcast(MSG.JOBS_UPDATED, { count: list.length });
+  // 岗位库变化（沟通、屏蔽、标不感兴趣、投递完成）都可能让今日清单失效：排一次刷新
+  scheduleApplyRefresh();
   return list;
 }
 
@@ -1125,7 +1981,10 @@ async function sendMessageWithRetry(tabId, msg, tries = 6, gap = 700) {
       if (res) return res;
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
-      if (!/Receiving end does not exist/i.test(lastErr)) throw new Error(lastErr);
+      // 导航会断开消息端口：content-script 还没就绪 / 正在跳转，稍后重试
+      if (!/Receiving end does not exist|message port closed|Could not establish connection|No tab with id/i.test(lastErr)) {
+        throw new Error(lastErr);
+      }
     }
     await sleep(gap);
   }
@@ -1276,6 +2135,7 @@ async function scoreOneNow(uid, jobArg, { force = false, requireDetail = false }
   await setJobMatch(job.uid, match);
   if (job.autoScoreFails) await patchJob(job.uid, { autoScoreFails: 0, autoScoreError: '' });
   broadcast(MSG.JOBS_UPDATED, { uid: job.uid, scored: true });
+  scheduleApplyRefresh(); // 新分数可能让岗位进入今日投递清单
   return match;
 }
 
@@ -1396,4 +2256,9 @@ function sleep(ms) {
 }
 
 // 清理关闭的 tab 上下文
-chrome.tabs.onRemoved.addListener((tabId) => tabContext.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabContext.delete(tabId);
+  applyTabs.delete(tabId);
+  // 触发补全的列表页被关掉后，后续任务不要再往那个已关闭的窗口里开标签页
+  if (progressTab && progressTab.id === tabId) progressTab = null;
+});

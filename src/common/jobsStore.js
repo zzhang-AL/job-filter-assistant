@@ -112,12 +112,14 @@ export function isDetailReady(j) {
 }
 
 // 从给定岗位里挑出需要补抓详情的（无 JD，或详情已超过 staleMs 未刷新——HR 活跃时间会过期）。
-// 只处理有独立详情页的 BOSS 岗位；沟通过的这个岗位不再补（同公司的其他岗位照常补，供匹配用）。
-export function pickJobsNeedingDetail(list, uids, { staleMs = 24 * 3600 * 1000 } = {}) {
+// 只处理有独立详情页的 BOSS 岗位；沟通过的这个岗位不再补（同公司的其他岗位默认也不补，
+// 但每日自动搜索允许通过 allowCompanyContacted 保留「已沟通公司的未沟通岗位」）。
+export function pickJobsNeedingDetail(list, uids, { staleMs = 24 * 3600 * 1000, allowCompanyContacted = false } = {}) {
   const want = new Set(uids);
   const now = Date.now();
   return list
-    .filter((j) => want.has(j.uid) && j.platform === 'boss' && j.contacted !== 'job' && bossDetailPageUrl(j))
+    .filter((j) => want.has(j.uid) && j.platform === 'boss' && bossDetailPageUrl(j))
+    .filter((j) => j.contacted !== 'job' && (allowCompanyContacted || j.contacted !== 'company'))
     .filter((j) => !j.description || !j.detailAt || now - Date.parse(j.detailAt) > staleMs)
     // 列表里 HR 在线的先补（更可能在招），其余保持列表顺序
     .sort((a, b) => (b.hrOnline === true) - (a.hrOnline === true))
