@@ -1354,6 +1354,12 @@ function applyCountText() {
   return `待确认 ${c.pending || 0} · 今日已投 ${c.applied || 0}`;
 }
 
+function retryRemaining(st) {
+  const runUids = new Set((st && st.run && Array.isArray(st.run.uids) ? st.run.uids : []));
+  const items = (st && st.batch && st.batch.items) || [];
+  return items.filter((it) => it.status === 'failed' || (it.status === 'pending' && (!runUids.size || runUids.has(it.uid)))).length;
+}
+
 function renderApplyStatusBar() {
   const box = h('div', { class: 'sp-status', id: 'sp-apply-status' });
   const st = applyStatus;
@@ -1393,7 +1399,7 @@ function renderApplyStatusBar() {
       compact: true,
       title: run.state === 'error' ? '上次投递中断' : run.state === 'stopped' ? '上次投递已停止' : '上次投递完成',
       desc: `完成 ${done + failed}/${run.total} · 成功 ${done} · 失败 ${failed}${run.error ? ` · ${run.error}` : ''}`,
-      actions: failed ? [{ label: `重试失败 ${failed} 个`, primary: true, onClick: () => retryFailedUi() }] : [],
+      actions: retryRemaining(st) ? [{ label: `继续投递 ${retryRemaining(st)} 个`, primary: true, onClick: () => retryFailedUi() }] : [],
     }));
   }
   return box;
@@ -1493,7 +1499,7 @@ function renderApplyCard(it) {
     (it.status === 'pending' || it.status === 'failed')
       ? h('div', { class: 'apply-card-actions' }, [
           it.status === 'failed'
-            ? h('button', { class: 'btn btn-xs btn-ghost', text: '重试', onclick: (e) => { e.stopPropagation(); retryApplyItem(it); } })
+            ? h('button', { class: 'btn btn-xs btn-ghost', text: '重试此岗位', onclick: (e) => { e.stopPropagation(); retryApplyItem(it); } })
             : null,
           !running
             ? h('button', {
@@ -1563,8 +1569,8 @@ function fillApplyBottom(bar) {
         h('button', { class: 'btn btn-sm btn-ghost danger-text', text: '关闭所选', onclick: closeApplySelected }),
         iconBtn('more', '更多', (e) =>
           openMenu(e.currentTarget, [
-            items.some((it) => it.status === 'failed')
-              ? { icon: 'refresh', label: '重试失败岗位', hint: '不需要重新勾选，直接重跑失败项', onClick: () => retryFailedUi() }
+            retryRemaining(st)
+              ? { icon: 'refresh', label: '继续投递剩余岗位', hint: '从上次中断处继续，不需要重新勾选', onClick: () => retryFailedUi() }
               : null,
             { icon: 'refresh', label: '刷新清单', hint: '把新匹配的岗位补进来', onClick: refreshApplyUi },
             { icon: 'gear', label: '自动投递设置', hint: '搜索条件、时间和每日上限', onClick: () => send(MSG.OPEN_OPTIONS, { section: 'autoapply' }) },
@@ -1574,20 +1580,30 @@ function fillApplyBottom(bar) {
     );
     return;
   }
-  const failed = items.filter((it) => it.status === 'failed').length;
-  bar.appendChild(
-    h('button', {
-      class: 'btn btn-sm ' + (pending.length ? 'btn-primary' : failed ? 'btn-ghost' : 'btn-ghost'),
-      disabled: !pending.length,
-      title: '先全选待确认岗位，再点「确认投递」',
-      onclick: selectAllApply,
-    }, [icon('check'), pending.length ? `全选待确认（${pending.length}）` : '没有待确认岗位']),
-  );
-  if (failed) {
+  const remaining = retryRemaining(st);
+  const canContinue = remaining > 0 && ((st && st.run && Number(st.run.total || 0) > 0) || !pending.length);
+  if (canContinue && !pending.length) {
     bar.appendChild(h('button', {
-      class: 'btn btn-sm ' + (pending.length ? 'btn-tonal' : 'btn-primary'),
+      class: 'btn btn-sm btn-primary',
+      title: '从上次中断处继续，失败项会重新投递',
       onclick: () => retryFailedUi(),
-    }, [icon('refresh'), `重试失败 ${failed}`]));
+    }, [icon('refresh'), `继续投递剩余 ${remaining} 个`]));
+  } else {
+    bar.appendChild(
+      h('button', {
+        class: 'btn btn-sm ' + (pending.length ? 'btn-primary' : 'btn-ghost'),
+        disabled: !pending.length,
+        title: '先全选待确认岗位，再点「确认投递」',
+        onclick: selectAllApply,
+      }, [icon('check'), pending.length ? `全选待确认（${pending.length}）` : '没有待确认岗位']),
+    );
+    if (canContinue) {
+      bar.appendChild(h('button', {
+        class: 'btn btn-sm btn-tonal',
+        title: '从上次中断处继续，失败项会重新投递',
+        onclick: () => retryFailedUi(),
+      }, [icon('refresh'), `继续投递 ${remaining}`]));
+    }
   }
   bar.appendChild(h('div', { class: 'spacer' }));
   bar.appendChild(h('button', { class: 'btn btn-sm btn-ghost', onclick: refreshApplyUi }, [icon('refresh'), '刷新清单']));
@@ -1667,7 +1683,7 @@ async function rejectApplyItem(it) {
 async function retryFailedUi(uids = []) {
   try {
     const r = await send(MSG.APPLY_RETRY_FAILED, { uids });
-    toast(r && r.started ? `开始重试 ${r.total || uids.length || ''} 个岗位` : '已开始重试');
+    toast(r && r.started ? `继续投递 ${r.total || uids.length || ''} 个岗位` : '已开始继续投递');
     await refreshApplyStatus();
     render();
   } catch (e) {

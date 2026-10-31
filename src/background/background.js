@@ -1021,7 +1021,7 @@ let applyStopRequested = false;
 function publicApplyRun() {
   return applyRun
     ? { ...applyRun }
-    : { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false };
+    : { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false, uids: [] };
 }
 
 function persistApplyRun() {
@@ -1402,10 +1402,20 @@ async function retryFailedApply(uids) {
   if (halt) throw new Error(`投递已暂停：${halt.reason}，请先在设置页解除暂停`);
   const batch = await loadApplyBatch();
   const wanted = new Set((Array.isArray(uids) ? uids : []).filter(Boolean));
-  const list = batch.items.filter((it) => it.status === 'failed' && (!wanted.size || wanted.has(it.uid)));
-  if (!list.length) throw new Error('没有可重试的失败岗位');
+  // 不传 uids（顶部「继续投递 / 重试失败」）= 继续上一轮没投完的：
+  //   failed + 上一轮选中但还没轮到的 pending；已关闭/已投的不动。
+  // 传 uids（单张卡片「重试此岗位」）= 只重试这一张的 failed。
+  const runUids = new Set(applyRun && Array.isArray(applyRun.uids) ? applyRun.uids : []);
+  const list = batch.items.filter((it) => {
+    if (wanted.size) return wanted.has(it.uid) && it.status === 'failed';
+    if (it.status === 'failed') return true;
+    if (it.status === 'pending' && (!runUids.size || runUids.has(it.uid))) return true;
+    return false;
+  });
+  if (!list.length) throw new Error('没有需要继续投递的岗位');
   const targets = list.map((it) => it.uid);
-  await markApplyItems(targets, { status: 'pending', note: '', reviewedAt: new Date().toISOString() });
+  const failedIds = new Set(list.filter((it) => it.status === 'failed').map((it) => it.uid));
+  if (failedIds.size) await markApplyItems([...failedIds], { status: 'pending', note: '', reviewedAt: new Date().toISOString() });
   return startApplyRun(targets);
 }
 
@@ -1431,6 +1441,7 @@ async function startApplyRun(uids) {
       finishedAt: 0,
       error: '',
       stopRequested: false,
+      uids: items.map((it) => it.uid),
     };
     broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
     persistApplyRun();

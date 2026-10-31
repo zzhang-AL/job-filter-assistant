@@ -537,10 +537,19 @@
     if (lastApplyClick.key === (jobKey || location.href) && Date.now() - lastApplyClick.at < 60000) {
       return { ok: true, mode: 'clicked', repeat: true };
     }
-    const start = await waitFor(findStartChatButton, 10000);
+    const start = await waitFor(findStartChatButton, 12000);
     if (!start) {
       const b = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
-      return b ? { ok: false, blocked: b } : { ok: false, error: '未找到「立即沟通」按钮（页面结构可能变了）' };
+      if (b) return { ok: false, blocked: b };
+      const title = String(document.title || '');
+      const body = String((document.body && document.body.innerText) || '').slice(0, 400).replace(/\s+/g, ' ');
+      if (/请稍候|正在加载中|加载中/.test(title + body)) {
+        return { ok: false, error: '页面一直停留在加载中（可能被风控拦截或网络异常），请稍后重试' };
+      }
+      if (/职位已关闭|职位已下线|停止招聘|职位不存在|该职位已/.test(body)) {
+        return { ok: false, error: '职位已关闭或停止招聘，无法发起沟通' };
+      }
+      return { ok: false, error: '未找到「立即沟通」按钮（页面结构可能变了，或岗位已下架）' };
     }
     // 详情页上必须落在主操作区（岗位 banner / 详情容器 / 页面顶部已知主按钮），否则宁可失败也不乱点
     const inDetailScope = !!start.closest('.job-banner, .job-detail-container, .job-detail-box, .job-detail, .job-op, .job-detail-header, .job-primary');
