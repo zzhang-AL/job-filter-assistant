@@ -377,3 +377,7 @@ input.invalid:focus, textarea.invalid:focus { box-shadow: 0 0 0 3px rgba(255, 59
   .auto-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .auto-next { margin-left: 0; }
 }
+
+/* 模型 ID：输入框 + 拉取后的可见下拉框（datalist 在部分环境不弹候选） */
+.model-field { display: flex; flex-direction: column; gap: 6px; }
+.model-field select.model-select { width: 100%; }

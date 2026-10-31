@@ -746,6 +746,24 @@ function renderProviderCard(prov, isActive) {
   const modelInput = bind('model', { ph: '如 gpt-4o-mini' });
   const modelList = h('datalist', { id: `models-${prov.id}` }, prov.discoveredModels.map((m) => opt(m, m)));
   modelInput.setAttribute('list', `models-${prov.id}`);
+  // datalist 在部分 Chrome / 扩展页面里点击时不会弹候选（没有可见的箭头），
+  // 拉取到模型后再给一个真正的 <select>，保证“展开下拉框”一定可用。
+  const modelSelect = prov.discoveredModels.length
+    ? h('select', { class: 'model-select', 'aria-label': '选择已拉取的模型' }, [
+        opt('', `选择模型（${prov.discoveredModels.length} 个）`),
+        ...prov.discoveredModels.map((m) => opt(m, m)),
+      ])
+    : null;
+  if (modelSelect) {
+    modelSelect.value = prov.discoveredModels.includes(prov.model) ? prov.model : '';
+    modelSelect.addEventListener('change', async () => {
+      if (!modelSelect.value) return;
+      prov.model = modelSelect.value;
+      modelInput.value = prov.model;
+      await saveProviders(providers);
+      toast(`已选择模型 ${prov.model}`);
+    });
+  }
 
   const keyInput = bind('apiKey', { type: 'password', ph: 'sk-...' });
   const keyWrap = h('div', { class: 'secret' }, [
@@ -781,7 +799,7 @@ function renderProviderCard(prov, isActive) {
       field('API Base URL', bind('baseUrl', { ph: 'https://api.example.com/v1' })),
       h('div', { class: 'grid-2' }, [
         field(prov.protocol === 'gemini' ? 'API Key（通过 query 传递）' : 'API Key', keyWrap, { hint: '只保存在本机' }),
-        field('模型 ID', h('div', {}, [modelInput, modelList]), { hint: prov.discoveredModels.length ? `已拉取 ${prov.discoveredModels.length} 个模型，输入框可下拉选择` : '可点「拉取模型列表」获取候选' }),
+        field('模型 ID', h('div', { class: 'model-field' }, [modelInput, modelList, modelSelect].filter(Boolean)), { hint: prov.discoveredModels.length ? `已拉取 ${prov.discoveredModels.length} 个模型，可从下拉框选择，也可直接输入` : '可点「拉取模型列表」获取候选' }),
       ]),
       advToggle,
       advWrap,
