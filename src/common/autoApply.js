@@ -88,7 +88,7 @@ export function defaultAutoApply() {
     dailyCollectCap: 50, // 每天自动搜索最多新收录多少个岗位（用于补详情 + AI 匹配）
     dailyCap: 20, // 每天最多纳入投递清单多少个（关闭的也占当天名额）
     includeCompanyContacted: true, // 已沟通公司的其他未沟通岗位也纳入
-    applyForeground: true, // 点「立即沟通」时前台打开页面
+    applyForeground: false, // false = 后台标签页执行，不抢焦点
     applyGapMinSec: 5,
     applyGapMaxSec: 12,
     applyKeepTab: false, // 点完是否保留标签页

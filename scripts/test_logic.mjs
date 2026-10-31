@@ -731,6 +731,11 @@ test('旧设置没有 pacing 时补默认值', () => {
   const s = mergeSettings({ autoCapture: true });
   assert.deepEqual(s.pacing, defaultPacing());
 });
+test('自动投递默认后台标签页执行；旧设置迁移为后台', () => {
+  assert.equal(defaultAutoApply().applyForeground, false);
+  assert.equal(mergeSettings({ settingsRev: 3, autoApply: { applyForeground: true } }).autoApply.applyForeground, false);
+  assert.equal(mergeSettings({ settingsRev: 4, autoApply: { applyForeground: true } }).autoApply.applyForeground, true, '用户新设置要保留');
+});
 
 // ---------- 自动匹配前置条件 ----------
 section('详情就绪（自动匹配前置）');

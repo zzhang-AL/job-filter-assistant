@@ -1176,7 +1176,7 @@ function renderAutoApply() {
     const listCap = (st.config && st.config.dailyCap) || 0;
     const stat = h('div', { class: 'auto-stats' }, [
       statCell('待确认', counts.pending || 0, 'accent'),
-      statCell('已沟通', counts.applied || 0, 'green'),
+      statCell('今日已投', counts.applied || 0, 'green'),
       statCell('已关闭', counts.rejected || 0, 'muted'),
       statCell('今日收录', `${collect.count || 0}/${collect.cap || 0}`, 'muted'),
     ]);
@@ -1337,7 +1337,7 @@ function renderAutoApply() {
 
   mainEl.appendChild(
     panel('确认后如何打开', '用户点「确认投递」后，按清单顺序逐个打开岗位页并点「立即沟通」。只发起沟通，不自动发消息。', [
-      setRow('前台打开页面', '关闭时在后台标签页点击（不抢焦点，但你看不到过程）', cfg.applyForeground, (v) => { cfg.applyForeground = v; saveNow(); }),
+      setRow('在后台标签页执行', '开启后不抢焦点，逐个在后台标签页点击「立即沟通」；关闭则前台打开，方便观察过程', !cfg.applyForeground, (v) => { cfg.applyForeground = !v; saveNow(); }),
       setRow('点完保留标签页', '关闭时进入沟通页后自动关掉标签页；开启则留着让你接着聊', cfg.applyKeepTab, (v) => { cfg.applyKeepTab = v; saveNow(); }),
       ctlRow('投递间隔', '两个岗位之间随机等待，避免连续点击', h('span', { class: 'range' }, [
         numInput({ value: cfg.applyGapMinSec, min: 5, max: 120, unit: '秒', width: 70, onCommit: async (v) => { cfg.applyGapMinSec = v ?? 5; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.applyGapMinSec; } }),

@@ -1351,7 +1351,7 @@ async function tailorAdvice(job) {
 function applyCountText() {
   if (!applyStatus) return '投递清单';
   const c = (applyStatus.batch && applyStatus.batch.counts) || {};
-  return `待确认 ${c.pending || 0} · 已沟通 ${c.applied || 0}`;
+  return `待确认 ${c.pending || 0} · 今日已投 ${c.applied || 0}`;
 }
 
 function renderApplyStatusBar() {
@@ -1369,6 +1369,7 @@ function renderApplyStatusBar() {
     h('div', { class: 'apply-meta' }, [
       h('span', { class: 'apply-meta-item', text: `今日收录 ${collect.count || 0}/${collect.cap || 0}` }),
       h('span', { class: 'apply-meta-item', text: `清单 ${counts.total || 0}/${cfg.dailyCap || 0}` }),
+      h('span', { class: 'apply-meta-item', text: `今日已投 ${counts.applied || 0}` }),
       st.batch?.date ? h('span', { class: 'apply-meta-item muted', text: st.batch.date }) : null,
     ]),
   );
@@ -1382,8 +1383,17 @@ function renderApplyStatusBar() {
     box.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '今日自动收录已达上限', desc: s.lastSearchError || '' }));
   }
   const run = st.run || {};
-  if (run.state === 'error' && run.error) {
-    box.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次投递中断', desc: run.error }));
+  if (run.state !== 'running' && Number(run.total || 0) > 0) {
+    const done = Number(run.done || 0);
+    const failed = Number(run.failed || 0);
+    const tone = run.state === 'error' ? 'warn' : 'tip';
+    box.appendChild(notice({
+      tone,
+      ic: run.state === 'error' ? 'alert' : 'check',
+      compact: true,
+      title: run.state === 'error' ? '上次投递中断' : run.state === 'stopped' ? '上次投递已停止' : '上次投递完成',
+      desc: `完成 ${done + failed}/${run.total} · 成功 ${done} · 失败 ${failed}${run.error ? ` · ${run.error}` : ''}`,
+    }));
   }
   return box;
 }

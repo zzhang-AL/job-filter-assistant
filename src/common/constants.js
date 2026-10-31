@@ -147,7 +147,7 @@ export function defaultSettings() {
     skipContactedCompanies: true, // 沟通过的公司，其其他岗位也不再收录
     autoScore: true, // 收录 → 补全详情 → 自动 AI 匹配（需已配置 AI 接口；消耗 token，可在设置中关闭）
     aiConcurrency: 3, // 同时进行的 AI 分析数（受 AI 供应商限流约束，与 BOSS 风控无关）
-    settingsRev: 3, // 设置迁移版本：<2 打开 autoScore；<3 把旧「标准」额度 60/时·300/天 升到新标准
+    settingsRev: 4, // 设置迁移版本：<2 打开 autoScore；<3 升级标准额度；<4 自动投递改为后台标签页
     pacing: defaultPacing(), // 后台标签页节奏（模拟人工：随机间隔 / 停留 / 休息 / 活跃时段）
     autoApply: defaultAutoApply(), // 每日自动刷 BOSS 与投递清单
     showBadge: true, // 在岗位卡片上显示匹配角标

@@ -15,7 +15,7 @@
         enabled: true, dailyTime: '09:00', keywords: ['前端'], cityName: '广州', cityCode: '101280100',
         scrolls: 4, experience: [], salaryMinK: null, salaryMaxK: null, hrActiveMaxTier: 3,
         threshold: 70, dailyCollectCap: 50, dailyCap: 20, includeCompanyContacted: true,
-        applyForeground: true, applyGapMinSec: 5, applyGapMaxSec: 12, applyKeepTab: false,
+        applyForeground: false, applyGapMinSec: 5, applyGapMaxSec: 12, applyKeepTab: false,
       },
     },
     providers: [

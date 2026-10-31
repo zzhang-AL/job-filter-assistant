@@ -1013,12 +1013,19 @@ let refreshQueued = false;
 let refreshQueuedForce = false;
 let applyRun = null; // { state, total, done, failed, current, startedAt, finishedAt, error, stopRequested }
 let applyStarting = false;
+const APPLY_RUN_KEY = 'jobHelperApplyRunV1';
 let applyStopRequested = false;
 
 function publicApplyRun() {
   return applyRun
     ? { ...applyRun }
     : { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false };
+}
+
+function persistApplyRun() {
+  try {
+    chrome.storage.session.set({ [APPLY_RUN_KEY]: publicApplyRun() }).catch(() => {});
+  } catch {}
 }
 
 // 预留当天的「自动收录」名额。多个 joblist 响应可能几乎同时到达，用一条 Promise 链串行化，
@@ -1409,6 +1416,7 @@ async function startApplyRun(uids) {
       stopRequested: false,
     };
     broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+    persistApplyRun();
     runApplyQueue(items).catch(() => {});
     return { started: true, total: items.length };
   } finally {
@@ -1457,13 +1465,14 @@ async function runApplyQueue(items) {
       } else if (res.ok) {
         applyRun.done++;
         consecutiveFails = 0;
-        await markApplyItems([it.uid], { status: 'applied', appliedAt: new Date().toISOString(), note: '' });
+        await markApplyItems([it.uid], { status: 'applied', appliedAt: new Date().toISOString(), note: res.note || '' });
       } else {
         applyRun.failed++;
         consecutiveFails++;
         await markApplyItems([it.uid], { status: 'failed', note: res.error || '' });
       }
       broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+      persistApplyRun();
       if (res.blocked) {
         applyRun.error = res.error || 'BOSS 触发安全验证，已停止投递';
         break;
@@ -1482,6 +1491,7 @@ async function runApplyQueue(items) {
     applyRun.current = '';
     applyRun.finishedAt = Date.now();
     broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+    persistApplyRun();
     await refreshApplyList({ notify: true });
     await updateActionBadge();
   }
@@ -1567,7 +1577,12 @@ async function applyOne(item, cfg) {
         await setHalt(why, nav.blocked === 'login' ? 10 * 60 * 1000 : 30 * 60 * 1000, nav.blocked);
         return { ok: false, blocked: true, error: why };
       }
-      if (nav.unconfirmed) return { ok: false, unconfirmed: true, error: nav.error || '已进入聊天页，但无法确认是目标岗位的会话' };
+      if (nav.unconfirmed) {
+        // 已经点击并进入聊天页，只是无法确认会话身份。不要让它打断整批投递：
+        // 记为已沟通并附上提示，队列继续；用户可在聊天页自行核对。
+        await recordAppliedJob(job);
+        return { ok: true, unconfirmed: true, note: '已点击「立即沟通」，聊天会话未确认（可能页面结构变化）' };
+      }
       confirmed = nav.ok;
       chatTabId = nav.newTabId || 0;
       if (chatTabId) applyTabs.add(chatTabId);
@@ -2242,6 +2257,24 @@ async function exportJobs(format) {
   }
   return { format: 'json', content: JSON.stringify(jobs, null, 2), count: jobs.length };
 }
+
+// Service Worker 重启后把「上次投递」的进度恢复成中断状态，至少让界面能看到原因
+(async () => {
+  try {
+    const saved = (await chrome.storage.session.get(APPLY_RUN_KEY))[APPLY_RUN_KEY];
+    if (saved && saved.state === 'running') {
+      applyRun = {
+        ...saved,
+        state: 'error',
+        current: '',
+        finishedAt: Date.now(),
+        error: '上次投递被浏览器回收，已中断；请重新确认投递',
+      };
+      persistApplyRun();
+      broadcast(MSG.APPLY_UPDATED, { run: publicApplyRun() });
+    }
+  } catch {}
+})();
 
 function broadcast(type, payload) {
   chrome.runtime.sendMessage({ type, ...payload }).catch(() => {});

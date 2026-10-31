@@ -40,6 +40,11 @@ export function mergeSettings(input) {
       migrated.pacing = { ...p, hourlyCap: d.pacing.hourlyCap, dailyCap: d.pacing.dailyCap };
     }
   }
+  if (rev < 4) {
+    const a = isObj(input.autoApply) ? input.autoApply : {};
+    // 旧默认是前台打开（会抢焦点）；新默认改为后台标签页执行
+    if (a.applyForeground !== false) migrated.autoApply = { ...a, applyForeground: false };
+  }
   if (rev < d.settingsRev) migrated.settingsRev = d.settingsRev;
   return {
     ...d,
@@ -48,7 +53,7 @@ export function mergeSettings(input) {
     privacy: { ...d.privacy, ...(isObj(input.privacy) ? input.privacy : {}) },
     filters: { ...defaultFilters(), ...(isObj(input.filters) ? input.filters : {}) },
     pacing: sanitizePacing({ ...d.pacing, ...(isObj(input.pacing) ? input.pacing : {}), ...(migrated.pacing || {}) }),
-    autoApply: sanitizeAutoApply({ ...d.autoApply, ...(isObj(input.autoApply) ? input.autoApply : {}) }),
+    autoApply: sanitizeAutoApply({ ...d.autoApply, ...(isObj(input.autoApply) ? input.autoApply : {}), ...(migrated.autoApply || {}) }),
     aiConcurrency: clampInt(input.aiConcurrency, d.aiConcurrency, 1, 8),
   };
 }
