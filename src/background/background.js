@@ -1081,8 +1081,11 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
     let added = 0;
     const next = await updateApplyBatch((batch) => {
       const merged = mergeApplyBatch(batch, cands, { dateKey: dayKey });
+      const reconciled = reconcileApplyBatch(merged.batch, jobs, history, cfg, blockedSet);
+      // 没有新条目、也没有状态变化时不要整份写回 storage：tick / 每次岗位广播都会走到这里
+      if (sameApplyBatch(batch, reconciled)) return null;
       added = merged.added;
-      return reconcileApplyBatch(merged.batch, jobs, history, cfg, blockedSet);
+      return reconciled;
     });
     if (notify && added) broadcast(MSG.APPLY_UPDATED, { added, pending: countApply(next.items).pending });
     await updateActionBadge();
@@ -1096,6 +1099,26 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
       setTimeout(() => refreshApplyList({ notify, force: f }).catch(() => {}), 500);
     }
   }
+}
+
+function sameApplyBatch(a, b) {
+  if (!a || !b || a.date !== b.date) return false;
+  const ai = a.items || [];
+  const bi = b.items || [];
+  if (ai.length !== bi.length) return false;
+  for (let i = 0; i < ai.length; i++) {
+    const x = ai[i];
+    const y = bi[i];
+    if (
+      x.uid !== y.uid ||
+      x.status !== y.status ||
+      x.score !== y.score ||
+      x.note !== y.note ||
+      x.appliedAt !== y.appliedAt ||
+      x.updatedAt !== y.updatedAt
+    ) return false;
+  }
+  return true;
 }
 
 function reconcileApplyBatch(batch, jobs, history, cfg, blockedSet) {
@@ -1503,28 +1526,60 @@ async function applyOne(item, cfg) {
 // 点「立即沟通」后 BOSS 会整页跳到聊天页；轮询标签页 URL 确认，顺便识别登录 / 验证页。
 // 少数情况下 BOSS 会新开标签页，这时用 openerTabId 认领新标签，避免误判成失败再点一次。
 async function waitForChatTab(tabId, timeoutMs) {
-  const t0 = Date.now();
-  for (;;) {
-    let tab;
-    try {
-      tab = await chrome.tabs.get(tabId);
-    } catch {
-      return { ok: false, error: '标签页已关闭' };
-    }
-    const url = tab.url || '';
-    if (/\/web\/geek\/chat/.test(url) || /[?&#]chat\b/.test(url)) return { ok: true };
-    if (/\/web\/user\/(safe|verify)|security-check|verify-slider|\/web\/passport/.test(url)) return { ok: false, blocked: 'verify' };
-    try {
-      if (/^\/web\/user\/?$/.test(new URL(url).pathname)) return { ok: false, blocked: 'login' };
-    } catch {}
-    try {
-      const all = await chrome.tabs.query({});
-      const opened = all.find((t) => t.id !== tabId && t.openerTabId === tabId && /\/web\/geek\/chat/.test(t.url || ''));
-      if (opened) return { ok: true, newTabId: opened.id };
-    } catch {}
-    if (Date.now() - t0 > timeoutMs) return { ok: false };
-    await sleep(400);
-  }
+  return new Promise((resolve) => {
+    let done = false;
+    let pollTimer = null;
+    let deadlineTimer = null;
+    const cleanups = [];
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearInterval(pollTimer);
+      clearTimeout(deadlineTimer);
+      for (const fn of cleanups) { try { fn(); } catch {} }
+      resolve(result);
+    };
+    const checkTab = async (id = tabId) => {
+      let tab;
+      try {
+        tab = await chrome.tabs.get(id);
+      } catch {
+        if (id === tabId) finish({ ok: false, error: '标签页已关闭' });
+        return;
+      }
+      const url = tab.url || '';
+      if (/\/web\/geek\/chat/.test(url) || /[?&#]chat\b/.test(url)) {
+        finish({ ok: true, ...(id !== tabId ? { newTabId: id } : {}) });
+        return;
+      }
+      if (/\/web\/user\/(safe|verify)|security-check|verify-slider|\/web\/passport/.test(url)) {
+        finish({ ok: false, blocked: 'verify' });
+        return;
+      }
+      try {
+        if (/^\/web\/user\/?$/.test(new URL(url).pathname)) finish({ ok: false, blocked: 'login' });
+      } catch {}
+    };
+    // 用 onUpdated 替代每 400ms 查询所有标签页；轮询只针对当前一个 tab，开销小得多
+    const onUpdated = (id) => { if (id === tabId) checkTab(tabId); };
+    const onCreated = (tab) => {
+      if (tab.openerTabId !== tabId || tab.id == null) return;
+      const id = tab.id;
+      setTimeout(() => { if (!done) checkTab(id); }, 400);
+    };
+    const onRemoved = (id) => { if (id === tabId) finish({ ok: false, error: '标签页已关闭' }); };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onCreated.addListener(onCreated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    cleanups.push(
+      () => chrome.tabs.onUpdated.removeListener(onUpdated),
+      () => chrome.tabs.onCreated.removeListener(onCreated),
+      () => chrome.tabs.onRemoved.removeListener(onRemoved),
+    );
+    pollTimer = setInterval(() => checkTab(tabId), 1200);
+    deadlineTimer = setTimeout(() => finish({ ok: false, timeout: true }), timeoutMs);
+    checkTab(tabId);
+  });
 }
 
 async function updateActionBadge() {

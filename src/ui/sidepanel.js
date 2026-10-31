@@ -1,4 +1,4 @@
-import { MSG, MODE } from '../common/constants.js';
+import { MSG, MODE, STORAGE_KEYS } from '../common/constants.js';
 import { scoreProfile } from '../common/profile.js';
 import { applyFilters } from '../common/filters.js';
 import { hrActivityTier, activitySortKey, isStaleHr } from '../common/activity.js';
@@ -122,6 +122,14 @@ async function onCurrentJobChanged() {
 }
 
 const reloadSoon = debounce(() => reload({ background: true }), 600);
+// 设置页改了画像 / 供应商 / 设置：这两类数据不随岗位广播变化，单独做一次完整刷新
+const reloadFullSoon = debounce(() => reload(), 800);
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes[STORAGE_KEYS.profile] || changes[STORAGE_KEYS.aiProviders] || changes[STORAGE_KEYS.settings]) reloadFullSoon();
+  });
+} catch {}
 
 // background：由后台广播触发的刷新。用户正在输入（招呼语、搜索框）时先不重绘，等失焦后再补，避免打断输入
 let pendingRender = false;
@@ -145,15 +153,31 @@ app.addEventListener('focusout', () => {
 
 async function reload({ background = false } = {}) {
   try {
-    [jobs, settings, profile, providers, activeCtx] = await Promise.all([
-      send(MSG.JOB_LIST_REQUEST),
-      send(MSG.SETTINGS_GET),
-      send(MSG.PROFILE_GET),
-      send(MSG.AI_PROVIDERS_GET),
-      send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
+    if (background) {
+      // 后台广播只更新会频繁变化的数据；画像 / 供应商由 storage.onChanged 单独触发完整刷新
+      [jobs, settings, activeCtx] = await Promise.all([
+        send(MSG.JOB_LIST_REQUEST),
+        send(MSG.SETTINGS_GET),
+        send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
+      ]);
+    } else {
+      [jobs, settings, profile, providers, activeCtx] = await Promise.all([
+        send(MSG.JOB_LIST_REQUEST),
+        send(MSG.SETTINGS_GET),
+        send(MSG.PROFILE_GET),
+        send(MSG.AI_PROVIDERS_GET),
+        send(MSG.ACTIVE_CONTEXT_REQUEST).catch(() => null),
+      ]);
+    }
+    const [st, ap] = await Promise.all([
+      send(MSG.AUTO_STATUS_GET).catch(() => null),
+      send(MSG.AUTO_APPLY_STATUS_GET).catch(() => null),
     ]);
-    autoStatus = await send(MSG.AUTO_STATUS_GET).catch(() => autoStatus);
-    await refreshApplyStatus();
+    if (st) autoStatus = st;
+    if (ap) {
+      applyStatus = ap;
+      syncApplySelection(ap);
+    }
     // 平台筛选以用户最后一次的选择为准（侧边栏重开也保留）；只有模式设置真的被改了才跟随模式。
     // 后台刷新（收录、标记已沟通、出分数等）不能覆盖用户手动点选的平台
     if (lastMode === null) {

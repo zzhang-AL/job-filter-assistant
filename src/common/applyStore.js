@@ -28,10 +28,11 @@ export async function saveApplyBatch(batch) {
   await chrome.storage.local.set({ [BATCH_KEY]: batch && typeof batch === 'object' ? batch : { date: '', items: [] } });
 }
 
-// 在写锁内读出 → 交给 fn 修改 → 写回；fn 返回新 batch
+// 在写锁内读出 → 交给 fn 修改 → 写回；fn 返回 null/undefined 表示没有变化，跳过整份写回。
 export const updateApplyBatch = locked(async (fn) => {
   const cur = await loadApplyBatch();
-  const next = (await fn(cur)) || cur;
+  const next = await fn(cur);
+  if (!next) return cur;
   await saveApplyBatch(next);
   return next;
 });
