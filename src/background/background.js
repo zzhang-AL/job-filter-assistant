@@ -1052,9 +1052,7 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
   }
   refreshRunning = true;
   try {
-    const [jobs, settings, history, blocked, state] = await Promise.all([
-      loadJobs(), loadSettings(), loadApplyHistory(), loadBlocked(), loadAutoApplyState(),
-    ]);
+    const [settings, state] = await Promise.all([loadSettings(), loadAutoApplyState()]);
     const cfg = settings.autoApply;
     const today = dateKey();
     // 用户手动跑过一次搜索后，即使没开启「每日自动搜索」，当天的后续匹配也要能继续补进清单
@@ -1063,6 +1061,8 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
       await updateActionBadge();
       return null;
     }
+    // 只有真正要生成清单时才读岗位库 / 历史 / 屏蔽名单，关闭自动投递时刷新几乎零开销
+    const [jobs, history, blocked] = await Promise.all([loadJobs(), loadApplyHistory(), loadBlocked()]);
     const blockedSet = new Set((blocked || []).map((b) => b.uid));
     const cur = await loadApplyBatch();
     // 投递跨过午夜时不要滚动到新清单：否则后台标记结果找不到旧条目，当天状态会丢
@@ -1530,6 +1530,7 @@ async function waitForChatTab(tabId, timeoutMs) {
     let done = false;
     let pollTimer = null;
     let deadlineTimer = null;
+    let newTabId = 0; // BOSS 少数情况下会新开聊天天标签页
     const cleanups = [];
     const finish = (result) => {
       if (done) return;
@@ -1561,13 +1562,19 @@ async function waitForChatTab(tabId, timeoutMs) {
       } catch {}
     };
     // 用 onUpdated 替代每 400ms 查询所有标签页；轮询只针对当前一个 tab，开销小得多
-    const onUpdated = (id) => { if (id === tabId) checkTab(tabId); };
+    const onUpdated = (id) => {
+      if (id === tabId) checkTab(tabId);
+      else if (newTabId && id === newTabId) checkTab(newTabId);
+    };
     const onCreated = (tab) => {
       if (tab.openerTabId !== tabId || tab.id == null) return;
-      const id = tab.id;
-      setTimeout(() => { if (!done) checkTab(id); }, 400);
+      newTabId = tab.id;
+      setTimeout(() => { if (!done && newTabId) checkTab(newTabId); }, 400);
     };
-    const onRemoved = (id) => { if (id === tabId) finish({ ok: false, error: '标签页已关闭' }); };
+    const onRemoved = (id) => {
+      if (id === tabId) finish({ ok: false, error: '标签页已关闭' });
+      else if (id === newTabId) newTabId = 0;
+    };
     chrome.tabs.onUpdated.addListener(onUpdated);
     chrome.tabs.onCreated.addListener(onCreated);
     chrome.tabs.onRemoved.addListener(onRemoved);
@@ -1576,7 +1583,10 @@ async function waitForChatTab(tabId, timeoutMs) {
       () => chrome.tabs.onCreated.removeListener(onCreated),
       () => chrome.tabs.onRemoved.removeListener(onRemoved),
     );
-    pollTimer = setInterval(() => checkTab(tabId), 1200);
+    pollTimer = setInterval(() => {
+      checkTab(tabId);
+      if (newTabId) checkTab(newTabId);
+    }, 1200);
     deadlineTimer = setTimeout(() => finish({ ok: false, timeout: true }), timeoutMs);
     checkTab(tabId);
   });
