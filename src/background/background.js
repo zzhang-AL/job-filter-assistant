@@ -284,10 +284,13 @@ async function onJobsCaptured(msg, sender) {
       freshSeen.add(j.uid);
       fresh.push(j);
     }
-    const acceptable = (j) =>
-      !blocked.has(j.uid) &&
-      (!settings.skipContacted || j.contacted !== 'job') &&
-      (!settings.skipContacted || autoCfg.includeCompanyContacted || j.contacted !== 'company');
+    const acceptable = (j) => {
+      if (blocked.has(j.uid)) return false;
+      if (!settings.skipContacted) return true;
+      if (j.contacted === 'job') return false;
+      if (autoCfg.includeCompanyContacted) return true;
+      return !(j.contacted === 'company' && settings.skipContactedCompanies);
+    };
     const acceptedFresh = fresh.filter(acceptable);
     const slots = await reserveCollectSlots(acceptedFresh.length, autoCfg);
     if (slots < acceptedFresh.length) searchCapped = true;
@@ -1047,21 +1050,32 @@ async function refreshApplyList({ notify = false, force = false } = {}) {
   }
   refreshRunning = true;
   try {
-    const [jobs, settings, history, blocked] = await Promise.all([loadJobs(), loadSettings(), loadApplyHistory(), loadBlocked()]);
+    const [jobs, settings, history, blocked, state] = await Promise.all([
+      loadJobs(), loadSettings(), loadApplyHistory(), loadBlocked(), loadAutoApplyState(),
+    ]);
     const cfg = settings.autoApply;
-    if (!cfg.enabled && !force) {
+    const today = dateKey();
+    // 用户手动跑过一次搜索后，即使没开启「每日自动搜索」，当天的后续匹配也要能继续补进清单
+    const activeToday = state.lastSearchDate === today || state.collectDate === today;
+    if (!cfg.enabled && !force && !activeToday) {
       await updateActionBadge();
       return null;
     }
     const blockedSet = new Set((blocked || []).map((b) => b.uid));
     const cur = await loadApplyBatch();
     // 投递跨过午夜时不要滚动到新清单：否则后台标记结果找不到旧条目，当天状态会丢
-    const dayKey = applyRun && applyRun.state === 'running' && cur.date ? cur.date : dateKey();
+    const dayKey = applyRun && applyRun.state === 'running' && cur.date ? cur.date : today;
     // 只有和当前清单同一天时才把已有条目算进每日名额；跨天时只把「投递中」的条目带进新一天
     const existingForPick = cur.date && cur.date === dayKey
       ? cur.items
       : (cur.items || []).filter((it) => it.status === 'applying');
-    const cands = pickApplyCandidates(jobs, cfg, { existing: existingForPick, history });
+    // 每日清单只从「今天出现过」的岗位里选，避免历史岗位库在当天搜索完成前
+    // 就把名额占满，导致今天新收录 / 新匹配的岗位进不来。
+    const pool = jobs.filter((j) => {
+      const d = new Date(j.lastSeenAt || '');
+      return !isNaN(d.getTime()) && dateKey(d) === dayKey;
+    });
+    const cands = pickApplyCandidates(pool, cfg, { existing: existingForPick, history });
     let added = 0;
     const next = await updateApplyBatch((batch) => {
       const merged = mergeApplyBatch(batch, cands, { dateKey: dayKey });
@@ -1120,7 +1134,10 @@ async function autoApplyTick() {
   try {
     const [settings, state] = await Promise.all([loadSettings(), loadAutoApplyState()]);
     const cfg = settings.autoApply;
-    if (!cfg.enabled) return;
+    const today = dateKey();
+    // 没开启每日自动搜索，但今天手动跑过一次：仍要继续补详情 / 刷新清单，直到这一轮跑完
+    const activeToday = state.lastSearchDate === today || state.collectDate === today;
+    if (!cfg.enabled && !activeToday) return;
     if (!cfg.keywords.length) {
       await saveAutoApplyState({ lastSearchStatus: 'error', lastSearchError: '未配置岗位关键词（设置 → 自动投递）' });
       return;
@@ -1224,6 +1241,7 @@ async function triggerDailySearch(trigger = 'manual') {
 }
 
 async function runDailySearchNow(cfg) {
+  const runDay = dateKey(); // 搜索跨过午夜时，仍算作「发起那天」这次每日任务
   const errors = [];
   let halted = false;
   // 搜索前先同步一次沟通记录：确保「已沟通岗位」不会被推荐。
@@ -1253,7 +1271,7 @@ async function runDailySearchNow(cfg) {
   await saveAutoApplyState({
     // 未登录 / 验证页属于临时熔断：保留当天原状态（可能已经成功跑过），
     // 只在还没跑过时保持空日期，熔断解除后下一轮 tick 自动重试
-    lastSearchDate: halted ? (await loadAutoApplyState()).lastSearchDate || '' : dateKey(),
+    lastSearchDate: halted ? (await loadAutoApplyState()).lastSearchDate || '' : runDay,
     lastSearchAt: Date.now(),
     lastSearchStatus: errors.length ? 'error' : empty ? 'empty' : searchCapped ? 'capped' : 'ok',
     lastSearchError: errors.length
@@ -1274,6 +1292,13 @@ async function markApplyItemStatus(uids, status) {
   const list = Array.isArray(uids) ? uids : [uids];
   if (!list.length) return autoApplyStatus();
   await markApplyItems(list, { status, reviewedAt: new Date().toISOString() });
+  // 「不想要」是持久偏好：同时标成岗位库里的「不感兴趣」，以后搜索 / 匹配 / 清单都不会再推；
+  // 用户仍可在岗位库的「不感兴趣」分组里恢复。
+  if (status === 'rejected') {
+    try {
+      afterJobsChange(await markJobs(list, { dismissed: true }));
+    } catch {}
+  }
   broadcast(MSG.APPLY_UPDATED, {});
   await updateActionBadge();
   return autoApplyStatus();
@@ -1375,6 +1400,25 @@ async function runApplyQueue(items) {
   }
 }
 
+// 记录一次「已沟通」：岗位标记 + 沟通记录 + 历史已投。任何一步失败都不影响
+// 已经发生的点击，避免因为写库异常把已沟通的岗位留到明天重复投。
+async function recordAppliedJob(job) {
+  const now = new Date().toISOString();
+  try {
+    await patchJob(job.uid, { appliedAt: now, appliedSource: 'auto_apply' });
+  } catch {}
+  try {
+    const { jobs: list } = await addContacts(
+      [{ jobId: job.jobId, title: job.title, company: job.company, hrName: job.hrName }],
+      'auto_apply',
+    );
+    if (list) afterJobsChange(list);
+  } catch {}
+  try {
+    await addApplyHistory([{ uid: job.uid, title: job.title, company: job.company, at: now }]);
+  } catch {}
+}
+
 // 单个岗位：打开详情页 → content-script 点「立即沟通」→ 等页面进入聊天页 → 记为已沟通。
 // 只发起沟通，不自动发送任何消息；招呼语只在有草稿时预填。
 async function applyOne(item, cfg) {
@@ -1417,7 +1461,12 @@ async function applyOne(item, cfg) {
       return { ok: false, blocked: true, error: why };
     }
     if (!res || !res.ok) return { ok: false, error: (res && res.error) || '页面没有响应' };
-    if (res.mode === 'already') return { ok: true, skipped: true, reason: '页面显示「继续沟通」，已在别处沟通过' };
+    if (res.mode === 'already') {
+      // 页面显示「继续沟通」：说明已经在别处沟通过（可能是手动聊过、同步漏了）。
+      // 也要写入沟通记录 / 历史，否则明天还会被当成未沟通岗位重新推荐。
+      await recordAppliedJob(job);
+      return { ok: true, already: true };
+    }
 
     let confirmed = res.mode === 'chat';
     if (res.mode === 'clicked') {
@@ -1434,14 +1483,7 @@ async function applyOne(item, cfg) {
     }
     if (!confirmed) return { ok: false, error: '未确认进入沟通页' };
 
-    const now = new Date().toISOString();
-    await patchJob(job.uid, { appliedAt: now, appliedSource: 'auto_apply' });
-    const { jobs: list } = await addContacts(
-      [{ jobId: job.jobId, title: job.title, company: job.company, hrName: job.hrName }],
-      'auto_apply',
-    );
-    if (list) afterJobsChange(list);
-    await addApplyHistory([{ uid: job.uid, title: job.title, company: job.company, at: now }]);
+    await recordAppliedJob(job);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };

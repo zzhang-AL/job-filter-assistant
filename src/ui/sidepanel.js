@@ -1430,7 +1430,7 @@ function renderApplyCard(it) {
           ? h('button', {
               class: 'linklike muted apply-close',
               text: '不想要',
-              title: '从今日清单关闭，不再出现在今天',
+              title: '不想要：从清单关闭，并从以后推荐中排除（可在岗位库恢复）',
               onclick: (e) => { e.stopPropagation(); rejectApplyItem(it); },
             })
           : null,
@@ -1574,7 +1574,7 @@ async function closeApplySelected() {
     applyChecked.clear();
     await refreshApplyStatus();
     render();
-    toast(`已关闭 ${uids.length} 个岗位`);
+    toast(`已关闭 ${uids.length} 个岗位，以后不再推荐`);
   } catch (e) {
     toast(e.message, true);
   }
@@ -1586,7 +1586,7 @@ async function rejectApplyItem(it) {
     applyChecked.delete(it.uid);
     await refreshApplyStatus();
     render();
-    toast(`已关闭「${it.title || '该岗位'}」`);
+    toast(`已关闭「${it.title || '该岗位'}」，以后不再推荐`);
   } catch (e) {
     toast(e.message, true);
   }
