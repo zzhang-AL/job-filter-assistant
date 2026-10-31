@@ -35,13 +35,15 @@ export function tabRoleOf(tabId) {
 export function tabTaskOf(tabId) {
   const w = workers.get(tabId);
   if (!w) return { role: null };
-  return { role: w.role, dwellMs: Math.round(w.dwellSec.base * 1000), dwellMaxMs: Math.round(w.dwellSec.max * 1000), scroll: w.dwellSec.scroll };
+  return { role: w.role, dwellMs: Math.round(w.dwellSec.base * 1000), dwellMaxMs: Math.round(w.dwellSec.max * 1000), scroll: w.dwellSec.scroll, scrolls: w.scrolls || 0 };
 }
 
 let currentPacing = null;
 function dwellFor(role) {
   const p = currentPacing;
   if (!p) return { base: 3, max: 6, scroll: false };
+  // 搜索页由 content-script 自己控制滚动节奏，读完立刻回报，不额外停留
+  if (role === 'search') return { base: 1, max: 2, scroll: false };
   return {
     base: sampleSkewed(p.dwellMinSec, p.dwellMaxSec),
     max: p.dwellMaxSec,
@@ -163,14 +165,19 @@ async function userActive() {
 
 // 运行前的人工节奏检查：返回 { reason, retryMs? }，reason 非空表示本轮放弃，retryMs 是建议多久后再试。
 // urgent：用户刚点了「AI 分析」等，人就在跟前——不休息、只用较短的间隔。
-async function paceBeforeOpen(p, urgent) {
+// scheduled：用户预约的每日任务（如每天 9 点自动刷 BOSS）——不受活跃时段与电脑空闲限制，
+// 但仍受每小时 / 每天上限、打开间隔、验证熔断约束。
+// ignoreCaps：只给每日搜索页用。搜索本身一天只有几次，不应该被补详情的额度耗尽而整个跳过。
+async function paceBeforeOpen(p, urgent, scheduled = false, ignoreCaps = false) {
   if (!(await capBypassed())) {
-    if (!inActiveHours(p.activeHours)) return { reason: `不在设定的活跃时段（${p.activeHours}）` };
-    const daily = await dailyExceeded(p);
-    if (daily) return { reason: daily };
-    // 本小时额度满了：不在这里干等（界面看不到原因，像卡死），交给调用方挂起，到最早那次滑出一小时窗口时再继续
-    const hourWait = await hourlyWaitMs(p);
-    if (hourWait > 0) return { reason: `近一小时后台补全已达 ${p.hourlyCap} 次上限`, retryMs: hourWait };
+    if (!scheduled && !inActiveHours(p.activeHours)) return { reason: `不在设定的活跃时段（${p.activeHours}）` };
+    if (!ignoreCaps) {
+      const daily = await dailyExceeded(p);
+      if (daily) return { reason: daily };
+      // 本小时额度满了：不在这里干等（界面看不到原因，像卡死），交给调用方挂起，到最早那次滑出一小时窗口时再继续
+      const hourWait = await hourlyWaitMs(p);
+      if (hourWait > 0) return { reason: `近一小时后台补全已达 ${p.hourlyCap} 次上限`, retryMs: hourWait };
+    }
   }
   if (urgent) {
     const gap = Math.max(1500, sampleSkewed(p.gapMinSec, Math.min(p.gapMaxSec, p.gapMinSec * 2)) * 1000 / Math.max(1, p.detailConcurrency));
@@ -178,7 +185,7 @@ async function paceBeforeOpen(p, urgent) {
     if (wait > 0) await keepAliveSleep(wait);
     return {};
   }
-  if (p.onlyWhenActive && !(await userActive())) {
+  if (!scheduled && p.onlyWhenActive && !(await userActive())) {
     // 人离开了：等回来再继续，太久就放弃本轮（下次浏览列表时会重新排队）
     const t0 = Date.now();
     while (!(await userActive())) {
@@ -186,12 +193,14 @@ async function paceBeforeOpen(p, urgent) {
       await keepAliveSleep(15000);
     }
   }
-  // 每处理若干个就休息一段，像人看一会儿就停下
-  if (!breakAfter) breakAfter = randInt(p.breakEveryMin, p.breakEveryMax);
-  if (sinceBreak >= breakAfter) {
-    await keepAliveSleep(sampleSkewed(p.breakMinSec, p.breakMaxSec) * 1000);
-    sinceBreak = 0;
-    breakAfter = randInt(p.breakEveryMin, p.breakEveryMax);
+  // 每处理若干个就休息一段，像人看一会儿就停下（预约任务不额外休息，避免整条流水线拖到第二天）
+  if (!scheduled) {
+    if (!breakAfter) breakAfter = randInt(p.breakEveryMin, p.breakEveryMax);
+    if (sinceBreak >= breakAfter) {
+      await keepAliveSleep(sampleSkewed(p.breakMinSec, p.breakMaxSec) * 1000);
+      sinceBreak = 0;
+      breakAfter = randInt(p.breakEveryMin, p.breakEveryMax);
+    }
   }
   // 与上一次打开之间的随机间隔（按并发数摊薄；第一个也等，不在列表刚加载完就立刻打开）
   const gap = launchGapMs(p);
@@ -203,7 +212,7 @@ async function paceBeforeOpen(p, urgent) {
 // 在后台标签页打开 url，等待 content-script 回报（或超时），然后关闭。
 // 返回 { ok, blocked?, ... } ；被熔断 / 额度 / 时段限制时返回 { ok:false, skipped: 原因, retryMs?: 建议多久后再试 }。
 // 同时最多 detailConcurrency 个在进行（urgent 可多占一个，用户点了分析不必排在后台补全后面）。
-export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowId, urgent = false } = {}) {
+export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowId, urgent = false, scheduled = false, scrolls = 0, ignoreCaps = false } = {}) {
   const limit = Math.max(1, (await loadSettings()).pacing.detailConcurrency) + (urgent ? 1 : 0);
   await acquireSlot(limit);
   try {
@@ -214,7 +223,7 @@ export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowI
       if (halt && !(urgent && isLoginHalt(halt))) return { skipped: halt.reason };
       const p = (await loadSettings()).pacing;
       currentPacing = p;
-      const pace = await paceBeforeOpen(p, urgent);
+      const pace = await paceBeforeOpen(p, urgent, scheduled, ignoreCaps);
       if (pace.reason) return { skipped: pace.reason, retryMs: pace.retryMs };
       const halt2 = await getHalt(); // 等待期间可能被别的标签页触发了熔断
       if (halt2 && !(urgent && isLoginHalt(halt2))) return { skipped: halt2.reason };
@@ -222,7 +231,7 @@ export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowI
       lastRunAt = Date.now();
       sinceBreak++;
       // 超时要覆盖页面停留时长
-      return await openTab(url, role, timeoutMs + p.dwellMaxSec * 1000, windowId); // { wait }
+      return await openTab(url, role, timeoutMs + p.dwellMaxSec * 1000, windowId, scrolls); // { wait }
     });
     launchChain = launch.catch(() => {});
     const l = await launch;
@@ -257,12 +266,17 @@ function releaseSlot() {
 
 // 打开标签页，返回 { wait }：wait 是「等它出结果」的 Promise。包在对象里返回——
 // 直接返回 Promise 会被 async/await 自动展开，变成等页面读完才返回，下一个就没法并发打开了
-async function openTab(url, role, timeoutMs, windowId) {
+async function openTab(url, role, timeoutMs, windowId, scrolls = 0) {
   let tab;
   try {
     tab = await chrome.tabs.create({ url, active: false, ...(windowId != null ? { windowId } : {}) });
   } catch (e) {
-    return { wait: Promise.resolve({ ok: false, error: e instanceof Error ? e.message : String(e) }) };
+    // 原窗口可能已经关闭：退回当前窗口再试一次，避免整条补全队列被一个失效 windowId 拖死
+    try {
+      tab = await chrome.tabs.create({ url, active: false });
+    } catch (e2) {
+      return { wait: Promise.resolve({ ok: false, error: e2 instanceof Error ? e2.message : String(e2) }) };
+    }
   }
   const wait = new Promise((resolve) => {
     let done = false;
@@ -278,7 +292,7 @@ async function openTab(url, role, timeoutMs, windowId) {
     };
     const timer = setTimeout(() => finish({ ok: false, timeout: true }), timeoutMs);
     const ping = setInterval(keepAlive, 20000); // 页面停留期间保持后台存活
-    workers.set(tab.id, { role, finish, dwellSec: dwellFor(role) });
+    workers.set(tab.id, { role, finish, dwellSec: dwellFor(role), scrolls });
     trackOpen(tab.id, true);
   });
   return { wait };

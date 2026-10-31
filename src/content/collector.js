@@ -13,6 +13,7 @@
     WORKER_RESULT: 'WORKER_RESULT',
     DETAIL_PROGRESS: 'DETAIL_PROGRESS',
     WORKER_HALT_CLEAR: 'WORKER_HALT_CLEAR',
+    APPLY_CLICK: 'APPLY_CLICK',
   };
 
   // 判断嗅探到的 URL 是「列表」还是「岗位详情/卡片」
@@ -178,6 +179,7 @@
     return badgeEl;
   }
   function flashBadge() {
+    if (!roleReady || tabRole) return; // 后台任务页 / 角色未确认前不显示收录角标
     const el = ensureBadge();
     const halted = detailProgress.halted;
     let text = `已收录 ${captured} 次`;
@@ -200,7 +202,7 @@
   // —— DOM 兜底：当接口嗅探长时间未命中时，从可见卡片粗略抓取 ——
   // 仅作为兜底，字段不如接口完整。默认延迟启动，命中过接口则不启用。
   function domFallback() {
-    if (captured > 0 || !PLATFORM) return;
+    if (captured > 0 || !PLATFORM || !roleReady || tabRole) return;
     const jobs = PLATFORM === 'boss' ? scrapeBoss() : scrapeQcwy();
     if (jobs.length) {
       // 包装成接口信封形状，复用 background 的归一化
@@ -281,7 +283,8 @@
   //  读取页面自己加载出来的数据，回报后由 background 关闭标签页。
   //  普通浏览时同样会读取（用户自己打开详情页 / 沟通页也能顺带补全）。
   // ============================================================
-  let tabRole = null; // 'detail' | 'contacts' | null（null = 用户自己打开的页面）
+  let tabRole = null; // 'detail' | 'contacts' | 'search' | null（null = 用户自己打开的页面）
+  let roleReady = false; // TAB_ROLE 查询完成前不注入角标 / 兜底抓取，避免污染后台任务页
   const detailProgress = { done: 0, pending: 0, halted: '', resumeAt: 0 };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -374,6 +377,55 @@
     return { ok: true, count: entries.length };
   }
 
+  // —— 搜索页（每日自动刷 BOSS）：页面自己加载列表，我们只负责慢慢往下滚，触发后续分页 ——
+  // 岗位数据由 sniffer 捕获的 joblist 接口送回后台，这里只回报「滚了几次、看到多少卡片」。
+  async function runSearchPage(task) {
+    if (!/\/web\/geek\/job/.test(location.pathname)) {
+      const blocked = detectBlockedPage();
+      return blocked ? { ok: false, blocked } : { ok: false, error: '不在 BOSS 搜索页' };
+    }
+    const first = await waitFor(
+      () => document.querySelector('.job-card-wrap, li.job-card-box, .job-card-wrapper'),
+      15000,
+      400,
+    );
+    if (!first) {
+      const blocked = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
+      return blocked ? { ok: false, blocked } : { ok: false, error: '搜索页没有加载出岗位', noCards: true };
+    }
+    const scrolls = Math.max(0, Math.min(12, Number(task && task.scrolls) || 0));
+    let lastCards = countJobCards();
+    let lastCaptured = captured;
+    let stalls = 0;
+    for (let i = 0; i < scrolls; i++) {
+      await sleep(1200 + Math.random() * 1800);
+      const target = nearestScrollable(findJobListContainer());
+      const beforeCards = countJobCards();
+      const beforeCaptured = captured;
+      const viewport = target === document.scrollingElement ? innerHeight : target.clientHeight || innerHeight;
+      // 后台标签页会节流 smooth 滚动，这里用即时滚动；滚动后等卡片或接口响应增长再继续
+      target.scrollBy({ top: Math.max(400, viewport * 0.85), behavior: 'auto' });
+      if (target !== document.scrollingElement) window.scrollBy({ top: 120, behavior: 'auto' });
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        await sleep(350);
+        if (countJobCards() > beforeCards || captured > beforeCaptured) break;
+      }
+      const blocked = detectBlockedPage();
+      if (blocked) return { ok: false, blocked };
+      const n = countJobCards();
+      // 隐藏标签页里卡片可能被虚拟列表回收，单看 DOM 数量会误判「到底了」；
+      // 同时看 sniffer 捕获次数（每加载一页 joblist 都会 +1）。
+      const grew = n > lastCards || captured > lastCaptured;
+      stalls = grew ? 0 : stalls + 1;
+      lastCards = n;
+      lastCaptured = captured;
+      if (stalls >= 2) break; // 连续两次滚动都没有新数据：到底了
+    }
+    await sleep(1200); // 等最后一个 joblist 响应落地，再让后台关标签页
+    return { ok: true, count: lastCards };
+  }
+
   // 后台任务页读完数据后，像人一样在页面上停留一会儿再关；详情页按 JD 长度多看几秒，并分几次慢慢往下滚
   async function humanDwell(task, textLength = 0) {
     if (!task || !task.dwellMs) return;
@@ -394,31 +446,49 @@
   }
 
   async function initPageRole() {
-    if (PLATFORM !== 'boss') return;
-    const task = await request(MSG.TAB_ROLE, {});
-    tabRole = task && task.role ? task.role : null;
-    const blocked = detectBlockedPage();
-    if (blocked) {
-      if (tabRole) send(MSG.WORKER_RESULT, { role: tabRole, ok: false, blocked });
+    if (PLATFORM !== 'boss') {
+      roleReady = true;
       return;
     }
-    if (/\/job_detail\//.test(location.pathname)) {
-      const res = await scrapeDetailPage();
-      if (tabRole === 'detail') {
-        if (res && res.ok) await humanDwell(task, res.textLength || 0);
-        send(MSG.WORKER_RESULT, { role: 'detail', ...(res || { ok: false }) });
+    try {
+      const task = await request(MSG.TAB_ROLE, {});
+      tabRole = task && task.role ? task.role : null;
+      const blocked = detectBlockedPage();
+      if (blocked) {
+        if (tabRole) send(MSG.WORKER_RESULT, { role: tabRole, ok: false, blocked });
+        return;
       }
-    } else if (detectChat()) {
-      const res = await runChatPage();
-      if (tabRole === 'contacts') {
-        await humanDwell(task);
-        send(MSG.WORKER_RESULT, { role: 'contacts', ...res });
+      if (tabRole === 'search') {
+        try {
+          const res = await runSearchPage(task);
+          send(MSG.WORKER_RESULT, { role: 'search', ...res });
+        } catch (e) {
+          send(MSG.WORKER_RESULT, { role: 'search', ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
+        return;
       }
-    } else if (tabRole) {
-      send(MSG.WORKER_RESULT, { role: tabRole, ok: false });
+      if (/\/job_detail\//.test(location.pathname)) {
+        const res = await scrapeDetailPage();
+        if (tabRole === 'detail') {
+          if (res && res.ok) await humanDwell(task, res.textLength || 0);
+          send(MSG.WORKER_RESULT, { role: 'detail', ...(res || { ok: false }) });
+        }
+      } else if (detectChat()) {
+        const res = await runChatPage();
+        if (tabRole === 'contacts') {
+          await humanDwell(task);
+          send(MSG.WORKER_RESULT, { role: 'contacts', ...res });
+        }
+      } else if (tabRole) {
+        send(MSG.WORKER_RESULT, { role: tabRole, ok: false });
+      }
+    } finally {
+      roleReady = true;
+      // 用户自己打开的列表 / 详情页：启用「HR 活跃优先」按钮和隐藏已沟通卡片（含详情页的推荐列表）
+      if (!tabRole && !detectChat()) initBossListUi();
     }
   }
-  initPageRole().catch(() => {});
+  initPageRole().catch(() => { roleReady = true; });
 
   // ============================================================
   //  一键发送招呼语：DOM 自动化（等价于用户手动在聊天框打字并点发送）
@@ -435,6 +505,62 @@
       }
     })();
     return true; // 异步响应
+  });
+
+  // —— 自动投递：在岗位详情页点「立即沟通」 ——
+  // 只发起沟通，不自动发送任何消息；招呼语只在有草稿时预填进聊天框，发不发由用户决定。
+  let lastApplyClick = { key: '', at: 0 };
+  async function autoClickStartChat(text, expectedJobId) {
+    const blocked = detectBlockedPage();
+    if (blocked) return { ok: false, blocked };
+    const m = location.pathname.match(/job_detail\/([\w~-]+)\.html/);
+    const jobKey = m ? m[1] : '';
+    // 目标岗位校验：岗位下架后可能被重定向到别的岗位 / 非详情页，绝不能对着错误页面点沟通
+    if (expectedJobId && jobKey !== String(expectedJobId)) {
+      return { ok: false, error: '当前页面岗位与清单不一致（可能已下架或跳转），已跳过' };
+    }
+    // 已经在聊天页：上一次点击已经进来了，或用户自己打开了聊天
+    if (detectChat()) {
+      const input = await waitFor(findChatInput, 8000);
+      return input ? { ok: true, mode: 'chat' } : { ok: false, error: '聊天页输入框未出现' };
+    }
+    // 后台重试同一条 APPLY_CLICK 时不重复点：导航前的一次点击已经发出，再点会变成「继续沟通」
+    if (lastApplyClick.key === (jobKey || location.href) && Date.now() - lastApplyClick.at < 60000) {
+      return { ok: true, mode: 'clicked', repeat: true };
+    }
+    const start = await waitFor(findStartChatButton, 10000);
+    if (!start) {
+      const b = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
+      return b ? { ok: false, blocked: b } : { ok: false, error: '未找到「立即沟通」按钮（页面结构可能变了）' };
+    }
+    // 详情页上必须落在主操作区（岗位 banner / 详情容器 / 页面顶部已知主按钮），否则宁可失败也不乱点
+    const inDetailScope = !!start.closest('.job-banner, .job-detail-container, .job-detail-box, .job-detail, .job-op, .job-detail-header, .job-primary');
+    const mainClass = start.matches('a.btn-startchat, .btn-startchat, a.op-btn-chat, .op-btn-chat');
+    const nearTop = start.getBoundingClientRect().top < innerHeight * 0.6;
+    if (jobKey && !inDetailScope && !(mainClass && nearTop)) {
+      return { ok: false, error: '找到的沟通按钮不在岗位主操作区，已跳过' };
+    }
+    if (isInsideJobCard(start)) return { ok: false, error: '找到的沟通按钮属于岗位卡片，已跳过' };
+    const label = (start.textContent || '').trim();
+    if (/继续沟通/.test(label)) return { ok: true, mode: 'already' };
+    if (!/立即沟通|马上沟通|开始聊天/.test(label)) return { ok: false, error: `按钮文字不是立即沟通：${label}` };
+    if (text) await savePendingGreeting(text); // 进入聊天页后由新页面接力填入，不自动发送
+    lastApplyClick = { key: jobKey || location.href, at: Date.now() };
+    // 先让本次 sendResponse 送达 background，再点击：导航会销毁当前 content-script、断开消息端口
+    setTimeout(() => { try { start.click(); } catch {} }, 150);
+    return { ok: true, mode: 'clicked' };
+  }
+
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || msg.type !== MSG.APPLY_CLICK) return false;
+    (async () => {
+      try {
+        sendResponse(await autoClickStartChat(String(msg.text || ''), msg.jobId));
+      } catch (e) {
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
   });
 
   function isVisible(el) {
@@ -484,24 +610,34 @@
 
   // 找「开始/继续沟通」按钮：岗位详情页/列表抽屉里点它会（整页）跳转到聊天页。
   // 优先用真机实测确认的稳定 class；文字匹配作兜底（class 改版时仍能命中）。
+  // 自动投递时尤其要避开列表卡片里的「立即沟通」——那会点开别的岗位，所以卡片内的按钮一律排除。
+  function isInsideJobCard(el) {
+    return !!el.closest('.job-card-wrap, .job-card-wrapper, .job-card-box, li.job-card-box, .rec-job-list, .job-list-box, .job-list-container');
+  }
   function findStartChatButton() {
+    const textOk = (b) => {
+      const t = (b.textContent || '').trim();
+      if (t.length > 12) return false;
+      return PLATFORM === 'boss'
+        ? /立即沟通|继续沟通|马上沟通|开始聊天/.test(t)
+        : /立即沟通|继续沟通|在线沟通|聊一聊|投递并沟通/.test(t);
+    };
     if (PLATFORM === 'boss') {
       // 实测：列表页抽屉 = a.op-btn-chat；独立详情页 = a.btn-startchat
       for (const sel of ['a.op-btn-chat', 'a.btn-startchat', '.op-btn-chat', '.btn-startchat']) {
         const el = document.querySelector(sel);
-        if (el && isVisible(el)) return el;
+        if (el && isVisible(el) && !isInsideJobCard(el)) return el;
       }
     }
-    const re = PLATFORM === 'boss'
-      ? /立即沟通|继续沟通|马上沟通|开始聊天/
-      : /立即沟通|继续沟通|在线沟通|聊一聊|投递并沟通/;
+    // 主按钮一般在详情顶部：优先在详情容器里找，避免误点推荐卡片的沟通按钮
+    for (const scopeSel of ['.job-banner', '.job-detail-container', '.job-detail-box', '.job-detail', '.job-op']) {
+      const scope = document.querySelector(scopeSel);
+      if (!scope) continue;
+      const hit = Array.from(scope.querySelectorAll('a, button, [role="button"]')).find((b) => isVisible(b) && textOk(b) && !isInsideJobCard(b));
+      if (hit) return hit;
+    }
     const nodes = Array.from(document.querySelectorAll('a, button, [role="button"], .btn, .op-btn, .btn-startchat, .start-chat'));
-    return nodes
-      .filter(isVisible)
-      .find((b) => {
-        const t = (b.textContent || '').trim();
-        return t.length <= 12 && re.test(t); // 限长，避免命中含该词的大容器
-      }) || null;
+    return nodes.filter(isVisible).filter((b) => !isInsideJobCard(b)).find(textOk) || null;
   }
 
   // 轮询等待某元素出现（用于等按钮/输入框在 SPA 里渲染出来）
@@ -643,7 +779,7 @@
   }
 
   function scheduleReapplyFresh() {
-    if (PLATFORM !== 'boss') return;
+    if (PLATFORM !== 'boss' || tabRole || !bossListUiInited) return;
     clearTimeout(reapplyTimer);
     reapplyTimer = setTimeout(() => {
       ensureFreshButton();
@@ -667,6 +803,22 @@
     let best = null, n = 0;
     count.forEach((v, k) => { if (v > n) { n = v; best = k; } });
     return best;
+  }
+
+  // 卡片本身通常不是滚动容器（列表常把 ul 撑开，真正滚动的是外层 div / window）。
+  // 从卡片容器往上找第一个能滚的元素，找不到就用文档滚动区。
+  function nearestScrollable(el) {
+    let n = el;
+    while (n && n !== document.body && n !== document.documentElement) {
+      const s = getComputedStyle(n);
+      if (/(auto|scroll|overlay)/.test(s.overflowY) && n.scrollHeight > n.clientHeight + 20) return n;
+      n = n.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function countJobCards() {
+    return document.querySelectorAll('.job-card-wrap, li.job-card-box, .job-card-wrapper').length;
   }
 
   // 列表容器里，每个「岗位行」= 容器的直接子元素
@@ -857,13 +1009,29 @@
     });
   }
 
-  if (PLATFORM === 'boss') {
+  // 列表页的「HR 活跃优先」/ 隐藏已沟通卡片只在用户自己浏览的标签里启用。
+  // 后台搜索标签也匹配这些选择器，隐藏行或重排会影响滚动加载，必须在 worker 标签里跳过。
+  let bossListUiInited = false;
+  function initBossListUi() {
+    if (PLATFORM !== 'boss' || bossListUiInited) return;
+    bossListUiInited = true;
     loadHideRules();
     // 侧边栏里屏蔽 / 同步了已沟通 / 改了设置：立即刷新本页卡片
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
         if (area !== 'local') return;
         if (changes[STORE.settings] || changes[STORE.blocked] || changes[STORE.contacts]) loadHideRules();
+      });
+    } catch {}
+    injectFreshStyles();
+    // 首屏与后续渲染都尝试注入按钮
+    const kick = () => { ensureFreshButton(); if (freshOn) applyFreshSort(); };
+    setTimeout(kick, 1200);
+    setTimeout(kick, 3000);
+    // 列表/筛选栏因 SPA 重渲染时，补注入 + 重排
+    try {
+      new MutationObserver(() => scheduleReapplyFresh()).observe(document.body || document.documentElement, {
+        subtree: true, childList: true,
       });
     } catch {}
   }
@@ -894,16 +1062,6 @@
   }
 
   if (PLATFORM === 'boss') {
-    injectFreshStyles();
-    // 首屏与后续渲染都尝试注入按钮
-    const kick = () => { ensureFreshButton(); if (freshOn) applyFreshSort(); };
-    setTimeout(kick, 1200);
-    setTimeout(kick, 3000);
-    // 列表/筛选栏因 SPA 重渲染时，补注入 + 重排
-    try {
-      new MutationObserver(() => scheduleReapplyFresh()).observe(document.body || document.documentElement, {
-        subtree: true, childList: true,
-      });
-    } catch {}
+    // 后台任务页的角色还没确认，等 initPageRole 决定是否启用列表页 UI
   }
 })();

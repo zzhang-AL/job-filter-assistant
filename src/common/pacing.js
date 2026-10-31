@@ -115,8 +115,9 @@ export function inActiveHours(spec, date = new Date()) {
 }
 
 // —— 详情补全队列的分档插入 ——
-// urgent（用户单个点了分析，等着要）> batch（批量分析前置补全）> 普通（列表收录后的补全）。
-export const taskTier = (it) => (it.urgent ? 0 : it.batch ? 1 : 2);
+// urgent（用户单个点了分析，等着要）> batch（批量分析前置补全）> daily（每日自动搜索的补全）> 普通（列表收录后的补全）。
+// daily 档不需要用户正停在 BOSS 页，也不受活跃时段限制（用户明确预约了每日任务）。
+export const taskTier = (it) => (it.urgent ? 0 : it.batch ? 1 : it.daily ? 2 : 3);
 
 // 把任务插进队列：已在队列里且新档更高则提档，否则不动；插在同档末尾。就地修改 queue，返回是否新加入。
 export function insertDetailTask(queue, task) {
@@ -126,7 +127,7 @@ export function insertDetailTask(queue, task) {
     const prev = queue[i];
     if (taskTier(task) >= taskTier(prev)) return false;
     queue.splice(i, 1);
-    it = { ...prev, urgent: task.urgent, batch: task.batch || prev.batch };
+    it = { ...prev, urgent: task.urgent, batch: task.batch || prev.batch, daily: task.daily || prev.daily };
   }
   const at = queue.findIndex((x) => taskTier(x) > taskTier(it));
   if (at < 0) queue.push(it);

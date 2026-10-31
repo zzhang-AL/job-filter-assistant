@@ -2,6 +2,7 @@
 import { STORAGE_KEYS, defaultSettings, defaultFilters } from './constants.js';
 import { sanitizeProviderList } from './ai/providers.js';
 import { sanitizePacing } from './pacing.js';
+import { sanitizeAutoApply } from './autoApply.js';
 
 const SET_KEY = STORAGE_KEYS.settings;
 const PROV_KEY = STORAGE_KEYS.aiProviders;
@@ -18,6 +19,7 @@ export async function saveSettings(patch) {
     filters: { ...cur.filters, ...(patch && patch.filters) },
     privacy: { ...cur.privacy, ...(patch && patch.privacy) },
     pacing: { ...cur.pacing, ...(patch && patch.pacing) },
+    autoApply: { ...cur.autoApply, ...(patch && patch.autoApply) },
   });
   await chrome.storage.local.set({ [SET_KEY]: next });
   return next;
@@ -46,6 +48,7 @@ export function mergeSettings(input) {
     privacy: { ...d.privacy, ...(isObj(input.privacy) ? input.privacy : {}) },
     filters: { ...defaultFilters(), ...(isObj(input.filters) ? input.filters : {}) },
     pacing: sanitizePacing({ ...d.pacing, ...(isObj(input.pacing) ? input.pacing : {}), ...(migrated.pacing || {}) }),
+    autoApply: sanitizeAutoApply({ ...d.autoApply, ...(isObj(input.autoApply) ? input.autoApply : {}) }),
     aiConcurrency: clampInt(input.aiConcurrency, d.aiConcurrency, 1, 8),
   };
 }

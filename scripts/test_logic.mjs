@@ -23,6 +23,14 @@ import { hrActivityTier, activityPenalty, activitySortKey, isStaleHr } from '../
 import { redactJobForAi } from '../src/common/ai/privacy.js';
 import { sampleSkewed, inActiveHours, sanitizePacing, defaultPacing, insertDetailTask, launchGapMs, PACING_PRESETS } from '../src/common/pacing.js';
 import { mergeSettings } from '../src/common/settingsStore.js';
+import {
+  defaultAutoApply, sanitizeAutoApply, buildBossSearchUrl, dailyDue, nextRunAt, dateKey,
+  experienceMatches, salaryMatches, cityMatches, hrActiveMatches, matchSearchFilter,
+  eligibleForApply, pickApplyCandidates, mergeApplyBatch, countApply,
+} from '../src/common/autoApply.js';
+import {
+  saveApplyBatch, markApplyItems, addApplyHistory, loadApplyHistory, saveAutoApplyState,
+} from '../src/common/applyStore.js';
 
 let pass = 0;
 let fail = 0;
@@ -220,6 +228,19 @@ test('补全队列只挑缺 JD 或详情过期、未沟通的 BOSS 岗位', () =
   const got = pickJobsNeedingDetail(lib, ['boss:a', 'boss:b', 'boss:c', 'boss:d', 'boss:g', 'qcwy:e']);
   assert.deepEqual(got.map((x) => x.uid), ['boss:a', 'boss:c'], '无详情页 / 新鲜 / 已沟通 / 非本批 都不入队');
   assert.equal(got[0].url, 'https://www.zhipin.com/job_detail/a.html?lid=la&securityId=sa', '带列表同款参数');
+});
+test('每日自动搜索：已沟通公司的未沟通岗位允许补详情，已沟通岗位仍排除', () => {
+  const u = (id) => `https://www.zhipin.com/job_detail/${id}.html`;
+  const lib = [
+    { uid: 'boss:h1', jobId: 'h1', platform: 'boss', url: u('h1'), contacted: 'company', raw: {} },
+    { uid: 'boss:h2', jobId: 'h2', platform: 'boss', url: u('h2'), contacted: 'job', raw: {} },
+  ];
+  assert.deepEqual(pickJobsNeedingDetail(lib, ['boss:h1', 'boss:h2']).map((x) => x.uid), [], '普通流程仍跳过已沟通公司');
+  assert.deepEqual(
+    pickJobsNeedingDetail(lib, ['boss:h1', 'boss:h2'], { allowCompanyContacted: true }).map((x) => x.uid),
+    ['boss:h1'],
+    '每日搜索保留同公司的未沟通岗位，但已沟通岗位仍排除',
+  );
 });
 test('详情页地址只认 BOSS job_detail', () => {
   assert.equal(bossDetailPageUrl({ url: 'https://evil.com/job_detail/a.html' }), '');
@@ -845,6 +866,158 @@ await testAsync('OpenAI 官方：带 prompt_cache_key，读取 cached_tokens', a
   );
   assert.equal(body.prompt_cache_key, 'job-filter-assistant');
   assert.equal(usage.cached, 1536);
+});
+
+// ---------- 每日自动投递（纯逻辑） ----------
+section('每日自动投递');
+
+test('默认配置关闭；非法时间 / 关键词 / 薪资被规整', () => {
+  const d = defaultAutoApply();
+  assert.equal(d.enabled, false);
+  const s = sanitizeAutoApply({ dailyTime: '25:00', keywords: [' 前端 ', '前端', ''], salaryMinK: 30, salaryMaxK: 20, scrolls: 99, applyGapMinSec: 20, applyGapMaxSec: 5 });
+  assert.equal(s.dailyTime, '09:00');
+  assert.deepEqual(s.keywords, ['前端']);
+  assert.equal(s.salaryMinK, 20, '上下限颠倒会纠正');
+  assert.equal(s.salaryMaxK, 30);
+  assert.equal(s.scrolls, 10, '滚动次数收敛到 1-10');
+  assert.equal(s.applyGapMinSec, 5, '间隔顺序纠正');
+  assert.equal(s.applyGapMaxSec, 20);
+  const fallback = sanitizeAutoApply({ cityName: '广州', cityCode: 'abc', experience: ['3-5年', '不存在的档位'] });
+  assert.equal(fallback.cityCode, '101280100', '非法城市编码回退到城市名对应编码');
+  assert.deepEqual(fallback.experience, ['3-5年'], '非法年限被过滤');
+  assert.equal(sanitizeAutoApply({ dailyCap: 0, threshold: 999 }).dailyCap, 1);
+  assert.equal(sanitizeAutoApply({ dailyCap: 0, threshold: 999 }).threshold, 100);
+});
+
+test('搜索地址带 query 与城市编码', () => {
+  const u = new URL(buildBossSearchUrl({ cityCode: '101280100' }, '前端 工程师'));
+  assert.equal(u.origin + u.pathname, 'https://www.zhipin.com/web/geek/jobs');
+  assert.equal(u.searchParams.get('query'), '前端 工程师');
+  assert.equal(u.searchParams.get('city'), '101280100');
+});
+
+test('每日定时：到点才跑、每天只跑一次、错过太久不在深夜补跑', () => {
+  const cfg = { ...defaultAutoApply(), enabled: true, keywords: ['前端'], dailyTime: '09:00' };
+  const day = new Date(2026, 9, 31, 8, 0, 0);
+  assert.equal(dailyDue(cfg, {}, day).due, false, '还没到点');
+  assert.equal(dailyDue(cfg, {}, new Date(2026, 9, 31, 9, 0, 0)).due, true, '正好到点');
+  const late = new Date(2026, 9, 31, 9, 30, 0);
+  assert.equal(dailyDue(cfg, {}, late).due, true);
+  assert.equal(dailyDue(cfg, { lastSearchDate: dateKey(late) }, late).due, false, '今天已经跑过');
+  const night = new Date(2026, 9, 31, 23, 0, 0);
+  const r = dailyDue(cfg, {}, night);
+  assert.equal(r.due, false, '错过超过 12 小时');
+  assert.equal(r.missed, true);
+  assert.ok(nextRunAt('09:00', new Date(2026, 9, 31, 10, 0)) > new Date(2026, 9, 31, 10, 0).getTime(), '下一次是明天');
+});
+
+test('年限区间重叠判断；薪资 / 城市 / HR 活跃度', () => {
+  assert.equal(experienceMatches('3-5年', ['3-5年']), true);
+  assert.equal(experienceMatches('5-10年', ['3-5年']), true, '在 5 年处重叠');
+  assert.equal(experienceMatches('10年以上', ['1-3年']), false);
+  assert.equal(experienceMatches('', ['3-5年']), true, '列表阶段未知先放行');
+  assert.equal(experienceMatches('', ['3-5年'], true), false, '清单阶段未知不放行');
+  assert.equal(experienceMatches('3-5年', ['经验不限']), true);
+
+  const cfg = { ...defaultAutoApply(), salaryMinK: 15, salaryMaxK: 30, cityName: '广州', hrActiveMaxTier: 2 };
+  assert.equal(salaryMatches({ salaryMinK: 20, salaryMaxK: 40 }, cfg), true);
+  assert.equal(salaryMatches({ salaryMinK: 10, salaryMaxK: 14 }, cfg), false);
+  assert.equal(salaryMatches({}, cfg), true, '列表阶段未知薪资先放行');
+  assert.equal(salaryMatches({}, cfg, true), false, '清单阶段未知薪资不放行');
+  assert.equal(salaryMatches({ salaryMinK: null, salaryMaxK: null }, cfg), true, '「面议」不能当成 0K 误杀');
+  assert.equal(salaryMatches({ salaryMinK: null, salaryMaxK: null }, cfg, true), false);
+  assert.equal(salaryMatches({ salaryMinK: null, salaryMaxK: 40 }, cfg), true, '只有上限时按上限判断');
+  assert.equal(cityMatches({ city: '广州' }, cfg), true);
+  assert.equal(cityMatches({ city: '深圳' }, cfg), false);
+  assert.equal(cityMatches({ city: '深圳' }, { ...cfg, cityName: '自定义' }), true, '自定义城市编码不做本地城市名过滤');
+  assert.equal(hrActiveMatches({ hrActiveText: '3日内活跃' }, cfg), true);
+  assert.equal(hrActiveMatches({ hrActiveText: '本月活跃' }, cfg), false);
+  assert.equal(hrActiveMatches({}, cfg), true, '列表阶段未知活跃先放行');
+  assert.equal(matchSearchFilter({ experience: '10年以上', salaryMinK: 10, salaryMaxK: 12, city: '深圳' }, cfg).keep, false);
+});
+
+const APPLY_JOB = (uid, over = {}) => ({
+  uid,
+  platform: 'boss',
+  jobId: uid.replace('boss:', ''),
+  title: '前端工程师',
+  company: '甲公司',
+  url: `https://www.zhipin.com/job_detail/${uid.replace('boss:', '')}.html`,
+  description: 'JD',
+  detailAt: '2026-10-31T00:00:00.000Z',
+  salaryMinK: 20,
+  salaryMaxK: 35,
+  city: '广州',
+  experience: '3-5年',
+  hrActiveText: '刚刚活跃',
+  contacted: '',
+  match: { score: 80, verdict: 'strong', summary: '匹配' },
+  ...over,
+});
+
+test('投递资格：已沟通岗位排除；已沟通公司的未沟通岗位按开关保留', () => {
+  const cfg = { ...defaultAutoApply(), threshold: 70 };
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a1'), cfg), true);
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a2', { contacted: 'job' }), cfg), false);
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a3', { contacted: 'company' }), cfg), true);
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a4', { contacted: 'company' }), { ...cfg, includeCompanyContacted: false }), false);
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a5', { match: { score: 60 } }), cfg), false, '低于门槛');
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a6', { platform: 'qcwy' }), cfg), false, '只投 BOSS');
+  assert.equal(eligibleForApply(APPLY_JOB('boss:a7', { dismissedAt: 't' }), cfg), false);
+});
+
+test('候选清单：分数排序、每日上限、同公司同名去重、历史已投排除', () => {
+  const cfg = { ...defaultAutoApply(), threshold: 70, dailyCap: 3 };
+  const jobs = [
+    APPLY_JOB('boss:b1', { match: { score: 90 } }),
+    APPLY_JOB('boss:b2', { match: { score: 85 }, company: '乙公司' }),
+    APPLY_JOB('boss:b3', { match: { score: 80 }, title: '高级前端工程师' }),
+    APPLY_JOB('boss:b4', { match: { score: 75 }, company: '丙公司' }),
+    APPLY_JOB('boss:b5', { match: { score: 95 } }),
+    APPLY_JOB('boss:b6', { match: { score: 99 }, company: '丁公司', title: '前端工程师' }),
+  ];
+  const picked = pickApplyCandidates(jobs, cfg, { history: { 'boss:b6': { at: 't' } } });
+  assert.equal(picked.length, 3, '受每日上限约束');
+  // b5 与 b1 同公司同名，分数更高，去重后只保留 b5
+  assert.deepEqual(picked.map((x) => x.uid), ['boss:b5', 'boss:b2', 'boss:b3']);
+  assert.equal(picked[0].status, 'pending');
+  assert.equal(picked[0].score, 95);
+  const withCompany = pickApplyCandidates([APPLY_JOB('boss:c1', { contacted: 'company' })], cfg);
+  assert.equal(withCompany.length, 1, '已沟通公司的未沟通岗位进清单');
+  const full = [{ uid: 'x1', status: 'skipped' }, { uid: 'x2', status: 'applied' }, { uid: 'x3', status: 'failed' }];
+  assert.equal(pickApplyCandidates([APPLY_JOB('boss:c2')], cfg, { existing: full }).length, 0, 'skipped/applied/failed 也占每日名额');
+  assert.equal(pickApplyCandidates([APPLY_JOB('boss:c3')], cfg, { existing: [{ uid: 'x4', status: 'rejected' }] }).length, 1, '已忽略不占名额');
+});
+
+test('清单合并：保留已确认状态、跨天重建、计数', () => {
+  const day = '2026-10-31';
+  const now = new Date(2026, 9, 31, 10, 0, 0);
+  const first = mergeApplyBatch(null, [APPLY_JOB('boss:d1') && {
+    uid: 'boss:d1', status: 'pending', score: 80, addedAt: now.toISOString(),
+  }], { dateKey: day, now });
+  assert.equal(first.batch.date, day);
+  assert.equal(first.added, 1);
+  const rejected = { ...first.batch, items: first.batch.items.map((it) => ({ ...it, status: 'rejected' })) };
+  const second = mergeApplyBatch(rejected, [{ uid: 'boss:d1', status: 'pending', score: 81 }, { uid: 'boss:d2', status: 'pending', score: 90 }], { dateKey: day, now });
+  assert.equal(second.added, 1, '已存在的条目不重复追加');
+  assert.equal(second.batch.items.find((it) => it.uid === 'boss:d1').status, 'rejected', '用户已忽略的状态不被覆盖');
+  const applying = { ...first.batch, items: [{ uid: 'boss:d9', status: 'applying', score: 80 }] };
+  const nextDay = mergeApplyBatch(applying, [], { dateKey: '2026-11-01', now });
+  assert.equal(nextDay.batch.items.length, 1, '跨天保留正在投递的条目');
+  assert.equal(nextDay.batch.items[0].status, 'applying');
+  assert.equal(countApply([{ status: 'pending' }, { status: 'applied' }, { status: 'applying' }]).pending, 1);
+  assert.equal(countApply([{ status: 'pending' }, { status: 'applied' }, { status: 'applying' }]).applying, 1);
+});
+
+await testAsync('投递清单存储：状态更新走写锁，历史与运行状态可持久化', async () => {
+  await saveApplyBatch({ date: '2026-10-31', items: [{ uid: 'boss:z1', status: 'pending' }] });
+  const b = await markApplyItems(['boss:z1'], { status: 'applied' });
+  assert.equal(b.items[0].status, 'applied');
+  await addApplyHistory([{ uid: 'boss:z1', title: 'X', company: 'Y' }]);
+  const h = await loadApplyHistory();
+  assert.ok(h['boss:z1']);
+  const st = await saveAutoApplyState({ lastSearchDate: '2026-10-31' });
+  assert.equal(st.lastSearchDate, '2026-10-31');
 });
 
 // ---------- 汇总 ----------
