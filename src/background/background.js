@@ -1008,6 +1008,7 @@ function pushProgress() {
 // 插件仍然不直接请求平台接口；搜索页的列表由页面自己发请求，插件只读结果。
 const AUTO_APPLY_TICK = 'jh-auto-apply-tick';
 const AUTO_APPLY_ALARM = 'jh-auto-apply-daily';
+const AUTO_APPLY_RETRY_ALARM = 'jh-auto-apply-retry'; // 失败退避到点：单独定闹钟，别等 10 分钟的 tick
 // 单次搜索页：一路滑到底，滑到底（连续 3 次没有新岗位 / 页面提示没有更多）才回报。
 // maxMs 是安全上限，防止页面卡住时标签页一直开着；标签页总超时要覆盖它。
 // 后台标签页的定时器会被 Chrome 节流（隐藏超过 5 分钟后进一步降频），
@@ -1319,6 +1320,12 @@ async function autoApplyTick() {
 async function ensureAutoApplyAlarm() {
   try {
     const settings = await loadSettings();
+    // 失败退避的重试闹钟与「每日自动搜索」开关无关：手动跑失败也要能重试
+    const state = await loadAutoApplyState();
+    const retryAt = Number(state.searchRetryAt || 0);
+    const retryLeft = Number(state.searchRetryCount || 0) < Number(settings.autoApply.searchRetryLimit || 0);
+    if (retryAt && retryLeft) await chrome.alarms.create(AUTO_APPLY_RETRY_ALARM, { when: retryAt });
+    else await chrome.alarms.clear(AUTO_APPLY_RETRY_ALARM);
     if (!settings.autoApply.enabled) {
       await chrome.alarms.clear(AUTO_APPLY_ALARM);
       return;
@@ -1331,6 +1338,14 @@ async function ensureAutoApplyAlarm() {
 // UI / 定时器触发一次搜索。立即返回，真正的搜索在后台跑（避免侧边栏 send 超时）。
 async function triggerDailySearch(trigger = 'manual') {
   if (searchRunning) return { started: false, running: true };
+  // 退避重试到点：先确认这次重试仍然有效（用户可能已经手动跑过 / 次数用完 / 时钟提前触发）
+  if (trigger === 'retry') {
+    const [st, state] = await Promise.all([loadSettings(), loadAutoApplyState()]);
+    const limit = Number(st.autoApply.searchRetryLimit || 0);
+    if (!Number(state.searchRetryAt || 0)) return { started: false, reason: '没有待重试的失败搜索' };
+    if (Number(state.searchRetryCount || 0) >= limit) return { started: false, reason: '自动重试次数已用完' };
+    if (Date.now() < Number(state.searchRetryAt)) return { started: false, reason: '还没到重试时间' };
+  }
   // 先占位再 await：alarm 与 10 分钟 tick 可能在同一分钟同时进来
   searchRunning = true;
   let cfg;
@@ -1468,7 +1483,12 @@ async function runDailySearchNow(cfg) {
     searchRetryAt: retryAt,
     searchRetryCount: retryCount,
   });
-  // 失败一定要让人看见：桌面通知 + 面板里的重试提示（tick 到点会自动重试）
+  // 用独立闹钟按退避时间精确重试（tick 只是兜底，粒度 10 分钟）
+  try {
+    if (retryAt) await chrome.alarms.create(AUTO_APPLY_RETRY_ALARM, { when: retryAt });
+    else await chrome.alarms.clear(AUTO_APPLY_RETRY_ALARM);
+  } catch {}
+  // 失败一定要让人看见：桌面通知 + 面板里的重试提示
   if (failed) {
     const when = retryAt
       ? `将于 ${fmtClock(retryAt)} 自动重试（第 ${retryCount}/${cfg.searchRetryLimit} 次）`
@@ -1675,7 +1695,7 @@ async function applyOne(item, cfg) {
   }
   if (stored && stored.dismissedAt) return { ok: true, skipped: true, reason: '已标为不感兴趣' };
   if (item.companyContacted && !cfg.includeCompanyContacted) {
-    return { ok: true, skipped: true, reason: '已关闭同公司其他岗位' };
+    return { ok: true, skipped: true, reason: '这家公司已经聊过，按设置跳过' };
   }
   if (stored && stored.appliedAt) return { ok: true, skipped: true, reason: '已投递过' };
   let tab = null;
@@ -1891,6 +1911,7 @@ try {
   chrome.alarms.onAlarm.addListener((a) => {
     if (a.name === AUTO_APPLY_TICK) autoApplyTick().catch(() => {});
     else if (a.name === AUTO_APPLY_ALARM) triggerDailySearch('alarm').catch(() => {});
+    else if (a.name === AUTO_APPLY_RETRY_ALARM) triggerDailySearch('retry').catch(() => {});
   });
 } catch {}
 setTimeout(() => {
