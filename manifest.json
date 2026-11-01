@@ -11,7 +11,7 @@
     "96": "icons/96.png",
     "128": "icons/128.png"
   },
-  "permissions": ["storage", "activeTab", "tabs", "sidePanel", "scripting", "downloads", "idle", "unlimitedStorage", "alarms"],
+  "permissions": ["storage", "activeTab", "tabs", "sidePanel", "scripting", "downloads", "idle", "unlimitedStorage", "alarms", "notifications"],
   "host_permissions": [
     "https://*.zhipin.com/*",
     "https://*.51job.com/*",

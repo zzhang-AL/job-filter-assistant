@@ -27,7 +27,7 @@ import {
   defaultAutoApply, sanitizeAutoApply, buildBossSearchUrl, dailyDue, nextRunAt, dateKey,
   experienceMatches, salaryMatches, cityMatches, hrActiveMatches, matchSearchFilter,
   eligibleForApply, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
-  viewedToday, viewQuota,
+  viewedToday, viewQuota, searchRetryPlan,
 } from '../src/common/autoApply.js';
 import {
   saveApplyBatch, markApplyItems, addApplyHistory, loadApplyHistory, saveAutoApplyState,
@@ -895,6 +895,9 @@ test('默认配置关闭；非法时间 / 关键词 / 薪资被规整', () => {
   assert.equal(sanitizeAutoApply({ dailyViewTarget: 0 }).dailyViewTarget, 1);
   assert.equal(sanitizeAutoApply({ dailyViewTarget: 99999 }).dailyViewTarget, 5000);
   assert.equal(defaultAutoApply().dailyViewTarget, 300, '默认每天刷 300 个岗位');
+  assert.equal(defaultAutoApply().searchRetryLimit, 5, '默认失败自动重试 5 次');
+  assert.equal(sanitizeAutoApply({ searchRetryLimit: -1 }).searchRetryLimit, 0);
+  assert.equal(sanitizeAutoApply({ searchRetryLimit: 99 }).searchRetryLimit, 10);
   assert.equal(s.applyGapMinSec, 5, '间隔顺序纠正');
   assert.equal(s.applyGapMaxSec, 20);
   const fallback = sanitizeAutoApply({ cityName: '广州', cityCode: 'abc', experience: ['3-5年', '不存在的档位'] });
@@ -1056,6 +1059,22 @@ test('每天刷岗位数：跨天归零，达标后剩余额度为 0', () => {
   assert.equal(viewQuota(cfg, { viewDate: '2026-10-31', viewed: 40 }, day), 60);
   assert.equal(viewQuota(cfg, { viewDate: '2026-10-31', viewed: 100 }, day), 0, '达标后不再开新的一轮');
   assert.equal(viewQuota(cfg, { viewDate: '2026-10-30', viewed: 100 }, day), 100, '新的一天重新计数');
+});
+
+test('搜索失败重试：10/20/40 分钟退避、封顶 40、次数可配', () => {
+  const t0 = 1000000;
+  const a = searchRetryPlan(0, t0, 5);
+  assert.deepEqual(a, { count: 1, at: t0 + 10 * 60 * 1000, done: false });
+  const b = searchRetryPlan(1, t0, 5);
+  assert.deepEqual(b, { count: 2, at: t0 + 20 * 60 * 1000, done: false });
+  const c = searchRetryPlan(2, t0, 5);
+  assert.deepEqual(c, { count: 3, at: t0 + 40 * 60 * 1000, done: false });
+  const d = searchRetryPlan(3, t0, 5);
+  assert.deepEqual(d, { count: 4, at: t0 + 40 * 60 * 1000, done: false }, '退避封顶 40 分钟');
+  assert.equal(searchRetryPlan(4, t0, 5).count, 5);
+  assert.deepEqual(searchRetryPlan(5, t0, 5), { count: 5, at: 0, done: true }, '用完次数后不再安排');
+  assert.deepEqual(searchRetryPlan(99, t0, 5), { count: 99, at: 0, done: true }, '历史计数异常也不会再试');
+  assert.deepEqual(searchRetryPlan(0, t0, 0), { count: 0, at: 0, done: true }, '0 = 不自动重试');
 });
 
 await testAsync('浏览量累加：并发写入不丢计数，跨天从 0 重算', async () => {

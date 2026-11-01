@@ -1165,7 +1165,19 @@ function renderAutoApply() {
         desc: `已刷 ${v.count || 0}/${v.target || 0} 个岗位；每轮滑到底后自动开下一页，达到「每天刷岗位数」才停。`,
       }));
     } else if (s.lastSearchStatus === 'error') {
-      statusBox.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败', desc: s.lastSearchError || '未知错误' }));
+      const retryAt = Number(s.retryAt || 0);
+      const waitMin = retryAt ? Math.round((retryAt - Date.now()) / 60000) : 0;
+      const attempt = `第 ${s.retryCount || 1}/${s.retryLimit || 0} 次`;
+      const retryText = retryAt
+        ? (waitMin > 0 ? `将于 ${fmtTime(retryAt)} 自动重试（${attempt}，约 ${waitMin} 分钟后）` : `等待自动重试（${attempt}，已到点）`)
+        : Number(s.retryLimit || 0) === 0
+          ? '自动重试已关闭'
+          : '自动重试次数已用完，可点「立即重试」';
+      statusBox.appendChild(notice({
+        tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败',
+        desc: `${s.lastSearchError || '未知错误'} · ${retryText}`,
+        actions: [{ label: '立即重试', primary: true, onClick: () => runNow() }],
+      }));
     } else if (s.lastSearchStatus === 'empty') {
       statusBox.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '上次搜索没有新增岗位', desc: s.lastSearchError || '' }));
     } else if (s.lastSearchStatus === 'capped') {
@@ -1343,7 +1355,10 @@ function renderAutoApply() {
         field('每日最多收录', numInput({ value: cfg.dailyCollectCap, min: 1, max: 300, unit: '个', onCommit: async (v) => { cfg.dailyCollectCap = v ?? 50; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCollectCap; } }), { hint: '达到上限当天不再入库，仍会继续刷到目标数量' }),
         field('每日清单上限', numInput({ value: cfg.dailyCap, min: 1, max: 100, unit: '个', onCommit: async (v) => { cfg.dailyCap = v ?? 20; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.dailyCap; } }), { hint: '关闭 / 已投也占当天名额' }),
       ]),
-      field('每页最多滑动', numInput({ value: cfg.maxScrolls, min: 10, max: 2000, unit: '次', onCommit: async (v) => { cfg.maxScrolls = v ?? 200; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.maxScrolls; } }), { hint: '正常滑到底会自动结束；这里是防止页面卡住的安全上限' }),
+      h('div', { class: 'grid-2' }, [
+        field('每页最多滑动', numInput({ value: cfg.maxScrolls, min: 10, max: 2000, unit: '次', onCommit: async (v) => { cfg.maxScrolls = v ?? 200; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.maxScrolls; } }), { hint: '正常滑到底会自动结束；这里是防止页面卡住的安全上限' }),
+        field('失败自动重试', numInput({ value: cfg.searchRetryLimit, min: 0, max: 10, unit: '次', onCommit: async (v) => { cfg.searchRetryLimit = v ?? 5; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.searchRetryLimit; } }), { hint: '打开页面失败时按 10 / 20 / 40 分钟退避重试；单页打不开还会当场再试 2 次；0 = 不自动重试' }),
+      ]),
       setRow('保留已沟通公司的其他岗位', '已沟通过的公司，其「未沟通」的岗位仍然纳入清单；已沟通过的岗位本身永远跳过', cfg.includeCompanyContacted, (v) => { cfg.includeCompanyContacted = v; saveNow(); refresh(); }),
     ]),
   );

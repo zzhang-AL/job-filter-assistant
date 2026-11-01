@@ -13,7 +13,7 @@ import { insertDetailTask, taskTier, randInt } from '../common/pacing.js';
 import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt, setHalt, setCapBypass } from './tabWorker.js';
 import {
   buildBossSearchUrl, dailyDue, dateKey, nextRunAt, matchSearchFilter, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
-  viewQuota, viewedToday,
+  viewQuota, viewedToday, searchRetryPlan,
 } from '../common/autoApply.js';
 import {
   loadApplyBatch, updateApplyBatch, loadApplyHistory, addApplyHistory, loadAutoApplyState, saveAutoApplyState, markApplyItems,
@@ -1016,6 +1016,8 @@ const SEARCH_PASS_MS = 4 * 60 * 1000;
 const SEARCH_PASS_TIMEOUT_MS = SEARCH_PASS_MS + 45000;
 const MAX_SEARCH_ROUNDS = 120; // 一天最多开多少轮搜索页（安全上限，正常由「每天刷岗位数」截断）
 const SEARCH_ROUND_PAUSE_MS = [3000, 7000]; // 两轮之间的额外停顿
+const SEARCH_PASS_RETRIES = 2; // 单页打不开（没渲染出岗位 / 超时）时，同一轮内立刻再试几次
+const SEARCH_PASS_RETRY_PAUSE_MS = [15000, 30000];
 let searchRunning = false;
 let searchCaptured = 0;
 let searchSeen = 0;
@@ -1030,6 +1032,28 @@ let applyRun = null; // { state, total, done, failed, current, startedAt, finish
 let applyStarting = false;
 const APPLY_RUN_KEY = 'jobHelperApplyRunV1';
 let applyStopRequested = false;
+
+// 桌面通知：设置了图标但没授予 notifications 权限时会静默失败，不能影响搜索本身
+async function notifyUser(title, message) {
+  try {
+    if (!chrome.notifications || !chrome.notifications.create) return;
+    await chrome.notifications.create(`jh-${Date.now()}`, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icons/128.png'),
+      title,
+      message: message || '',
+      priority: 1,
+    });
+  } catch {}
+}
+
+function fmtClock(ms) {
+  try {
+    return new Date(ms).toTimeString().slice(0, 5);
+  } catch {
+    return '';
+  }
+}
 
 function publicApplyRun() {
   return applyRun
@@ -1094,6 +1118,9 @@ async function autoApplyStatus() {
       lastSearchError: state.lastSearchError || '',
       lastSearchCount: state.lastSearchCount || 0,
       round: searchRunning ? searchRound : 0,
+      retryAt: Number(state.searchRetryAt || 0),
+      retryCount: Number(state.searchRetryCount || 0),
+      retryLimit: cfg.searchRetryLimit,
       nextRunAt: cfg.enabled && cfg.keywords.length ? nextRunAt(cfg.dailyTime) : 0,
     },
     batch: {
@@ -1244,7 +1271,7 @@ async function autoApplyTick() {
       && state.lastSearchStatus === 'error'
       && Number(state.searchRetryAt || 0) > 0
       && Date.now() >= Number(state.searchRetryAt)
-      && Number(state.searchRetryCount || 0) < 3;
+      && Number(state.searchRetryCount || 0) < Number(cfg.searchRetryLimit || 0);
     if (due.due || retryReady) {
       try {
         await triggerDailySearch(retryReady ? 'retry' : 'schedule');
@@ -1357,6 +1384,7 @@ async function runDailySearchNow(cfg) {
   // 重启后会从已刷数量接着刷，不会从零开始。
   let rounds = 0;
   let zeroRounds = 0;
+  let passFailures = 0;
   let paused = false;
   while (!halted) {
     const before = await loadAutoApplyState();
@@ -1386,17 +1414,26 @@ async function runDailySearchNow(cfg) {
       break;
     }
     if (!res.ok) {
-      errors.push(res.error || (res.timeout ? `搜索「${keyword}」加载超时` : `搜索「${keyword}」读取失败`));
+      const msg = res.error || (res.timeout ? `搜索「${keyword}」加载超时` : `搜索「${keyword}」读取失败`);
+      if (passFailures < SEARCH_PASS_RETRIES) {
+        // 单页打不开多半是页面慢 / 风控抖动：先不记失败，等一会儿用同一个关键词再来一次
+        passFailures++;
+        rounds--; // 这次不算一轮，重试同一个关键词
+        broadcast(MSG.APPLY_UPDATED, { searchPassRetry: { attempt: passFailures, error: msg } });
+        await sleep(SEARCH_PASS_RETRY_PAUSE_MS[0] + Math.random() * (SEARCH_PASS_RETRY_PAUSE_MS[1] - SEARCH_PASS_RETRY_PAUSE_MS[0]));
+        continue;
+      }
+      errors.push(msg);
       break;
     }
+    passFailures = 0;
     const after = await loadAutoApplyState();
     if (viewedToday(after) <= viewedBefore) {
-      // 页面打开了却一个岗位都没刷到：连着几轮都这样说明没内容可翻，交给定时重试
+      // 页面打开了却一个岗位都没刷到（关键词没结果 / 列表为空）：
+      // 连着几轮都这样就不再开页，按「没搜到」结束，不记失败也不发失败通知。
+      // 真正的页面故障（未捕获接口、超时）走上面的 res.ok=false 分支。
       zeroRounds++;
-      if (zeroRounds >= 3) {
-        errors.push('连续 3 轮没有刷到任何岗位');
-        break;
-      }
+      if (zeroRounds >= 3) break;
     } else {
       zeroRounds = 0;
     }
@@ -1411,8 +1448,9 @@ async function runDailySearchNow(cfg) {
   const empty = didRun && !errors.length && searchSeen === 0;
   const prev = await loadAutoApplyState();
   const failed = !!errors.length && !halted;
-  const retryCount = failed ? Math.min(3, Number(prev.searchRetryCount || 0) + 1) : 0;
-  const retryAt = failed && retryCount < 3 ? Date.now() + 10 * 60 * 1000 * Math.pow(2, retryCount - 1) : 0;
+  const plan = failed ? searchRetryPlan(prev.searchRetryCount, Date.now(), cfg.searchRetryLimit) : { count: 0, at: 0, done: false };
+  const retryCount = plan.count;
+  const retryAt = plan.at;
   await saveAutoApplyState({
     // 未登录 / 验证页属于临时熔断：保留当天原状态（可能已经成功跑过），
     // 只在还没跑过时保持空日期，熔断解除后下一轮 tick 自动重试
@@ -1430,6 +1468,13 @@ async function runDailySearchNow(cfg) {
     searchRetryAt: retryAt,
     searchRetryCount: retryCount,
   });
+  // 失败一定要让人看见：桌面通知 + 面板里的重试提示（tick 到点会自动重试）
+  if (failed) {
+    const when = retryAt
+      ? `将于 ${fmtClock(retryAt)} 自动重试（第 ${retryCount}/${cfg.searchRetryLimit} 次）`
+      : '自动重试次数已用完，可在设置 / 侧边栏点「立即重试」';
+    await notifyUser('自动搜索失败', `${errors.join('；')}；${when}`);
+  }
   // 搜索跨午夜时，午夜前收录的岗位 lastSeenAt 是昨天，也要纳入这一轮清单
   await refreshApplyList({ notify: true, force: true, sinceMs: runStartedAt });
 }

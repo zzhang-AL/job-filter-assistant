@@ -1388,7 +1388,16 @@ function renderApplyStatusBar() {
       desc: `已刷 ${view.count || 0}/${view.target || 0} 个；滑到底会自动开下一页，完成后补详情、AI 匹配并补进今日清单`,
     }));
   } else if (s.lastSearchStatus === 'error') {
-    box.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败', desc: s.lastSearchError || '未知错误' }));
+    const retryAt = Number(s.retryAt || 0);
+    const attempt = `第 ${s.retryCount || 1}/${s.retryLimit || 0} 次`;
+    const retryText = retryAt
+      ? (retryAt > Date.now() ? `将于 ${new Date(retryAt).toTimeString().slice(0, 5)} 自动重试（${attempt}）` : `等待自动重试（${attempt}，已到点）`)
+      : Number(s.retryLimit || 0) === 0 ? '自动重试已关闭' : '自动重试次数已用完';
+    box.appendChild(notice({
+      tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败',
+      desc: `${s.lastSearchError || '未知错误'} · ${retryText}`,
+      actions: [{ label: '立即重试', primary: true, onClick: () => runDailySearchUi() }],
+    }));
   } else if (s.lastSearchStatus === 'empty') {
     box.appendChild(notice({ tone: 'info', ic: 'info', compact: true, title: '上次搜索没有新增岗位', desc: s.lastSearchError || '' }));
   } else if (s.lastSearchStatus === 'capped') {

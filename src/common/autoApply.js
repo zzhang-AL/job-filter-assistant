@@ -81,6 +81,7 @@ export function defaultAutoApply() {
     cityCode: BOSS_CITY_CODES['全国'],
     maxScrolls: 200, // 单次搜索最多下滑多少次（安全上限；滑到底会自动提前结束）
     dailyViewTarget: 300, // 每天刷多少个岗位（含重复 / 已沟通 / 被本地筛掉的），达到就停止当天搜索
+    searchRetryLimit: 5, // 搜索失败后自动重试几次（0 = 不自动重试）；退避 10/20/40 分钟
     experience: [], // 空 = 不限
     salaryMinK: null,
     salaryMaxK: null,
@@ -130,6 +131,7 @@ export function sanitizeAutoApply(input) {
     cityCode,
     maxScrolls: num(o.maxScrolls, d.maxScrolls, 10, 2000),
     dailyViewTarget: num(o.dailyViewTarget, d.dailyViewTarget, 1, 5000),
+    searchRetryLimit: num(o.searchRetryLimit, d.searchRetryLimit, 0, SEARCH_RETRY_LIMIT_MAX),
     experience,
     salaryMinK,
     salaryMaxK,
@@ -211,6 +213,22 @@ export function viewedToday(state, now = new Date()) {
 export function viewQuota(cfg, state, now = new Date()) {
   const target = Math.max(0, Number(cfg && cfg.dailyViewTarget) || 0);
   return Math.max(0, target - viewedToday(state, now));
+}
+
+// —— 搜索失败后的自动重试 ——
+// 退避 10 / 20 / 40 分钟（封顶 40），最多 limit 次；limit = 0 表示不自动重试。
+// 只登记「还要不要再试、什么时候试」，真正重试由 10 分钟一次的 tick 触发。
+export const SEARCH_RETRY_LIMIT_MAX = 10;
+export const SEARCH_RETRY_BASE_MS = 10 * 60 * 1000;
+export const SEARCH_RETRY_MAX_MS = 40 * 60 * 1000;
+
+export function searchRetryPlan(prevCount, now = Date.now(), limit = 5) {
+  const max = Math.max(0, Math.min(SEARCH_RETRY_LIMIT_MAX, Math.floor(Number(limit) || 0)));
+  const used = Math.max(0, Math.floor(Number(prevCount) || 0));
+  if (!max || used >= max) return { count: used, at: 0, done: true };
+  const count = used + 1;
+  const waitMs = Math.min(SEARCH_RETRY_MAX_MS, SEARCH_RETRY_BASE_MS * Math.pow(2, count - 1));
+  return { count, at: now + waitMs, done: false };
 }
 
 // —— 条件判断 ——

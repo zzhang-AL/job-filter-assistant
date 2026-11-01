@@ -389,14 +389,34 @@
       const blocked = detectBlockedPage();
       return blocked ? { ok: false, blocked } : { ok: false, error: '不在 BOSS 搜索页' };
     }
-    const first = await waitFor(
+    let first = await waitFor(
       () => document.querySelector('.job-card-wrap, li.job-card-box, .job-card-wrapper'),
-      15000,
+      25000,
       400,
     );
+    // 卡片迟迟没渲染：再宽限一会儿（后台标签页首屏有时会慢一拍）
+    if (!first && captured === 0) {
+      first = await waitFor(
+        () => document.querySelector('.job-card-wrap, li.job-card-box, .job-card-wrapper'),
+        10000,
+        400,
+      );
+    }
     if (!first) {
       const blocked = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
-      return blocked ? { ok: false, blocked } : { ok: false, error: '搜索页没有加载出岗位', noCards: true };
+      if (blocked) return { ok: false, blocked };
+      // 卡片没渲染出来，但列表接口已经抓到岗位：后台照样能收录，不能算失败。
+      // （后台标签页里虚拟列表不渲染、或页面 DOM 结构变了，都会走到这里。）
+      if (captured > 0) {
+        await sleep(1500);
+        return { ok: true, count: 0, steps: 0, cardsMissing: true };
+      }
+      // 页面明确提示「没有找到相关职位」：关键词没结果，不是失败，别去触发重试和通知
+      const body = String((document.body && document.body.innerText) || '').slice(0, 4000);
+      if (/没有找到(相关|合适|符合)?(的)?(职位|岗位)|暂无(相关)?(职位|岗位)|换个关键词|换一个关键词|无搜索结果/.test(body)) {
+        return { ok: true, count: 0, steps: 0, empty: true };
+      }
+      return { ok: false, error: '搜索页没有加载出岗位', noCards: true };
     }
     // 一次滑到底：只要还加载得出新岗位就继续滑，连续 3 次没有新卡片 / 新接口才认为到底。
     // maxScrolls / maxMs 只是安全上限（防止页面卡住时标签页一直开着），不是常规停止条件。
