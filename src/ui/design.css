@@ -378,12 +378,19 @@ button:focus-visible, select:focus-visible, .jc-main:focus-visible {
   display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
 }
 .notice-close:hover { background: var(--fill-2); color: var(--text); }
-/* 单行提示：标题和操作放一行 */
+/* 紧凑提示：标题 + 操作一行，描述独占下一行。
+   不要用 flex 让标题和描述抢同一行——描述一长，标题会被压成每行一个字。 */
 .notice-compact { align-items: center; padding: 8px 12px; }
 .notice-compact .notice-ico { margin-top: 0; }
-.notice-compact .notice-body { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.notice-compact .notice-title { font-weight: 500; font-size: 12px; flex: 1; min-width: 0; }
-.notice-compact .notice-actions { margin-top: 0; }
+.notice-compact .notice-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 8px;
+}
+.notice-compact .notice-title { font-weight: 500; font-size: 12px; min-width: 0; }
+.notice-compact .notice-desc { grid-column: 1 / -1; min-width: 0; margin-top: 0; }
+.notice-compact .notice-actions { grid-column: 2; grid-row: 1; margin-top: 0; }
 
 /* ---------- 弹出菜单 ---------- */
 .menu {
