@@ -1370,9 +1370,11 @@ function renderApplyStatusBar() {
   const s = st.search || {};
   const counts = (st.batch && st.batch.counts) || {};
   const collect = st.collect || {};
+  const view = st.view || {};
   const cfg = st.config || {};
   box.appendChild(
     h('div', { class: 'apply-meta' }, [
+      h('span', { class: 'apply-meta-item', text: `今日已刷 ${view.count || 0}/${view.target || 0}` }),
       h('span', { class: 'apply-meta-item', text: `今日收录 ${collect.count || 0}/${collect.cap || 0}` }),
       h('span', { class: 'apply-meta-item', text: `清单 ${counts.total || 0}/${cfg.dailyCap || 0}` }),
       h('span', { class: 'apply-meta-item', text: `今日已投 ${counts.applied || 0}` }),
@@ -1380,7 +1382,11 @@ function renderApplyStatusBar() {
     ]),
   );
   if (s.running) {
-    box.appendChild(notice({ tone: 'tip', ic: 'refresh', compact: true, title: '正在自动搜索 BOSS…', desc: '完成后自动补详情、AI 匹配，新岗位会补进今日清单' }));
+    box.appendChild(notice({
+      tone: 'tip', ic: 'refresh', compact: true,
+      title: `正在自动搜索 BOSS…${s.round ? `（第 ${s.round} 轮）` : ''}`,
+      desc: `已刷 ${view.count || 0}/${view.target || 0} 个；滑到底会自动开下一页，完成后补详情、AI 匹配并补进今日清单`,
+    }));
   } else if (s.lastSearchStatus === 'error') {
     box.appendChild(notice({ tone: 'warn', ic: 'alert', compact: true, title: '上次自动搜索失败', desc: s.lastSearchError || '未知错误' }));
   } else if (s.lastSearchStatus === 'empty') {

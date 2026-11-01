@@ -79,7 +79,8 @@ export function defaultAutoApply() {
     keywords: [],
     cityName: '全国',
     cityCode: BOSS_CITY_CODES['全国'],
-    scrolls: 4, // 每次搜索向下滚动几次（每次约加载一页岗位）
+    maxScrolls: 200, // 单次搜索最多下滑多少次（安全上限；滑到底会自动提前结束）
+    dailyViewTarget: 300, // 每天刷多少个岗位（含重复 / 已沟通 / 被本地筛掉的），达到就停止当天搜索
     experience: [], // 空 = 不限
     salaryMinK: null,
     salaryMaxK: null,
@@ -127,7 +128,8 @@ export function sanitizeAutoApply(input) {
     keywords,
     cityName,
     cityCode,
-    scrolls: num(o.scrolls, d.scrolls, 1, 10),
+    maxScrolls: num(o.maxScrolls, d.maxScrolls, 10, 2000),
+    dailyViewTarget: num(o.dailyViewTarget, d.dailyViewTarget, 1, 5000),
     experience,
     salaryMinK,
     salaryMaxK,
@@ -197,6 +199,18 @@ export function collectQuota(cfg, state, now = new Date()) {
   const cap = Math.max(0, Number(cfg && cfg.dailyCollectCap) || 0);
   const used = state && state.collectDate === dateKey(now) ? Math.max(0, Number(state.collected) || 0) : 0;
   return Math.max(0, cap - used);
+}
+
+// 今天已经「刷到」多少个岗位。这里的数量是搜索页列表接口返回的原始岗位数，
+// 含重复 / 已沟通 / 被本地筛选掉的，与 collectQuota（真正入库、补详情的额度）分开算。
+export function viewedToday(state, now = new Date()) {
+  return state && state.viewDate === dateKey(now) ? Math.max(0, Number(state.viewed) || 0) : 0;
+}
+
+// 今天还要刷多少个岗位才到「每天刷岗位数」目标。
+export function viewQuota(cfg, state, now = new Date()) {
+  const target = Math.max(0, Number(cfg && cfg.dailyViewTarget) || 0);
+  return Math.max(0, target - viewedToday(state, now));
 }
 
 // —— 条件判断 ——

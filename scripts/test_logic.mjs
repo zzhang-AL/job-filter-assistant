@@ -27,9 +27,11 @@ import {
   defaultAutoApply, sanitizeAutoApply, buildBossSearchUrl, dailyDue, nextRunAt, dateKey,
   experienceMatches, salaryMatches, cityMatches, hrActiveMatches, matchSearchFilter,
   eligibleForApply, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
+  viewedToday, viewQuota,
 } from '../src/common/autoApply.js';
 import {
   saveApplyBatch, markApplyItems, addApplyHistory, loadApplyHistory, saveAutoApplyState,
+  loadAutoApplyState, addAutoApplyViews,
 } from '../src/common/applyStore.js';
 
 let pass = 0;
@@ -883,12 +885,16 @@ section('每日自动投递');
 test('默认配置关闭；非法时间 / 关键词 / 薪资被规整', () => {
   const d = defaultAutoApply();
   assert.equal(d.enabled, false);
-  const s = sanitizeAutoApply({ dailyTime: '25:00', keywords: [' 前端 ', '前端', ''], salaryMinK: 30, salaryMaxK: 20, scrolls: 99, applyGapMinSec: 20, applyGapMaxSec: 5 });
+  const s = sanitizeAutoApply({ dailyTime: '25:00', keywords: [' 前端 ', '前端', ''], salaryMinK: 30, salaryMaxK: 20, maxScrolls: 9999, applyGapMinSec: 20, applyGapMaxSec: 5 });
   assert.equal(s.dailyTime, '09:00');
   assert.deepEqual(s.keywords, ['前端']);
   assert.equal(s.salaryMinK, 20, '上下限颠倒会纠正');
   assert.equal(s.salaryMaxK, 30);
-  assert.equal(s.scrolls, 10, '滚动次数收敛到 1-10');
+  assert.equal(s.maxScrolls, 2000, '单页滑动上限收敛到 10-2000');
+  assert.equal(sanitizeAutoApply({ maxScrolls: 1 }).maxScrolls, 10);
+  assert.equal(sanitizeAutoApply({ dailyViewTarget: 0 }).dailyViewTarget, 1);
+  assert.equal(sanitizeAutoApply({ dailyViewTarget: 99999 }).dailyViewTarget, 5000);
+  assert.equal(defaultAutoApply().dailyViewTarget, 300, '默认每天刷 300 个岗位');
   assert.equal(s.applyGapMinSec, 5, '间隔顺序纠正');
   assert.equal(s.applyGapMaxSec, 20);
   const fallback = sanitizeAutoApply({ cityName: '广州', cityCode: 'abc', experience: ['3-5年', '不存在的档位'] });
@@ -1039,6 +1045,29 @@ await testAsync('投递清单存储：状态更新走写锁，历史与运行状
   assert.ok(h['boss:z1']);
   const st = await saveAutoApplyState({ lastSearchDate: '2026-10-31' });
   assert.equal(st.lastSearchDate, '2026-10-31');
+});
+
+test('每天刷岗位数：跨天归零，达标后剩余额度为 0', () => {
+  const cfg = sanitizeAutoApply({ dailyViewTarget: 100 });
+  const day = new Date(2026, 9, 31, 12, 0, 0);
+  assert.equal(viewedToday({ viewDate: '2026-10-31', viewed: 40 }, day), 40);
+  assert.equal(viewedToday({ viewDate: '2026-10-30', viewed: 40 }, day), 0, '昨天刷的不算今天');
+  assert.equal(viewedToday({}, day), 0);
+  assert.equal(viewQuota(cfg, { viewDate: '2026-10-31', viewed: 40 }, day), 60);
+  assert.equal(viewQuota(cfg, { viewDate: '2026-10-31', viewed: 100 }, day), 0, '达标后不再开新的一轮');
+  assert.equal(viewQuota(cfg, { viewDate: '2026-10-30', viewed: 100 }, day), 100, '新的一天重新计数');
+});
+
+await testAsync('浏览量累加：并发写入不丢计数，跨天从 0 重算', async () => {
+  await saveAutoApplyState({ viewDate: '2026-10-31', viewed: 0 });
+  await Promise.all(Array.from({ length: 5 }, () => addAutoApplyViews(12, '2026-10-31')));
+  let st = await loadAutoApplyState();
+  assert.equal(st.viewed, 60, '5 个并发响应各 12 个岗位都应记上');
+  await addAutoApplyViews(9, '2026-11-01');
+  st = await loadAutoApplyState();
+  assert.equal(st.viewed, 9, '新的一天从 0 开始累加');
+  assert.equal(st.viewDate, '2026-11-01');
+  assert.equal((await addAutoApplyViews(0, '2026-11-01')).viewed, 9, '空批次不写坏计数');
 });
 
 // ---------- 汇总 ----------

@@ -35,7 +35,14 @@ export function tabRoleOf(tabId) {
 export function tabTaskOf(tabId) {
   const w = workers.get(tabId);
   if (!w) return { role: null };
-  return { role: w.role, dwellMs: Math.round(w.dwellSec.base * 1000), dwellMaxMs: Math.round(w.dwellSec.max * 1000), scroll: w.dwellSec.scroll, scrolls: w.scrolls || 0 };
+  return {
+    role: w.role,
+    dwellMs: Math.round(w.dwellSec.base * 1000),
+    dwellMaxMs: Math.round(w.dwellSec.max * 1000),
+    scroll: w.dwellSec.scroll,
+    maxScrolls: w.maxScrolls || 0,
+    maxMs: w.maxMs || 0,
+  };
 }
 
 let currentPacing = null;
@@ -212,7 +219,7 @@ async function paceBeforeOpen(p, urgent, scheduled = false, ignoreCaps = false) 
 // 在后台标签页打开 url，等待 content-script 回报（或超时），然后关闭。
 // 返回 { ok, blocked?, ... } ；被熔断 / 额度 / 时段限制时返回 { ok:false, skipped: 原因, retryMs?: 建议多久后再试 }。
 // 同时最多 detailConcurrency 个在进行（urgent 可多占一个，用户点了分析不必排在后台补全后面）。
-export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowId, urgent = false, scheduled = false, scrolls = 0, ignoreCaps = false } = {}) {
+export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowId, urgent = false, scheduled = false, maxScrolls = 0, maxMs = 0, ignoreCaps = false } = {}) {
   const limit = Math.max(1, (await loadSettings()).pacing.detailConcurrency) + (urgent ? 1 : 0);
   await acquireSlot(limit);
   try {
@@ -231,7 +238,7 @@ export async function runInBackgroundTab(url, role, { timeoutMs = 30000, windowI
       lastRunAt = Date.now();
       sinceBreak++;
       // 超时要覆盖页面停留时长
-      return await openTab(url, role, timeoutMs + p.dwellMaxSec * 1000, windowId, scrolls); // { wait }
+      return await openTab(url, role, timeoutMs + p.dwellMaxSec * 1000, windowId, { maxScrolls, maxMs }); // { wait }
     });
     launchChain = launch.catch(() => {});
     const l = await launch;
@@ -266,7 +273,7 @@ function releaseSlot() {
 
 // 打开标签页，返回 { wait }：wait 是「等它出结果」的 Promise。包在对象里返回——
 // 直接返回 Promise 会被 async/await 自动展开，变成等页面读完才返回，下一个就没法并发打开了
-async function openTab(url, role, timeoutMs, windowId, scrolls = 0) {
+async function openTab(url, role, timeoutMs, windowId, { maxScrolls = 0, maxMs = 0 } = {}) {
   let tab;
   try {
     tab = await chrome.tabs.create({ url, active: false, ...(windowId != null ? { windowId } : {}) });
@@ -292,7 +299,7 @@ async function openTab(url, role, timeoutMs, windowId, scrolls = 0) {
     };
     const timer = setTimeout(() => finish({ ok: false, timeout: true }), timeoutMs);
     const ping = setInterval(keepAlive, 20000); // 页面停留期间保持后台存活
-    workers.set(tab.id, { role, finish, dwellSec: dwellFor(role), scrolls });
+    workers.set(tab.id, { role, finish, dwellSec: dwellFor(role), maxScrolls, maxMs });
     trackOpen(tab.id, true);
   });
   return { wait };

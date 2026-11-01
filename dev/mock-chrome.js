@@ -13,7 +13,7 @@
       filters: { enabled: false, keywordsInclude: [], keywordsExclude: [], riskKeywords: ['外包','驻场','猎头'], cities: [], salaryMinK: null, salaryMaxK: null, experience: [], degrees: [], excludeCompanies: [] },
       autoApply: {
         enabled: true, dailyTime: '09:00', keywords: ['前端'], cityName: '广州', cityCode: '101280100',
-        scrolls: 4, experience: [], salaryMinK: null, salaryMaxK: null, hrActiveMaxTier: 3,
+        maxScrolls: 200, dailyViewTarget: 300, experience: [], salaryMinK: null, salaryMaxK: null, hrActiveMaxTier: 3,
         threshold: 70, dailyCollectCap: 50, dailyCap: 20, includeCompanyContacted: true,
         applyForeground: false, applyGapMinSec: 5, applyGapMaxSec: 12, applyKeepTab: false,
       },
@@ -72,6 +72,7 @@
       enabled: state.settings.autoApply.enabled,
       config: state.settings.autoApply,
       collect: { date: '2026-10-31', count: Math.min(12, state.settings.autoApply.dailyCollectCap), cap: state.settings.autoApply.dailyCollectCap },
+      view: { date: '2026-10-31', count: 128, target: state.settings.autoApply.dailyViewTarget },
       search: { running: false, lastSearchDate: '2026-10-31', lastSearchAt: Date.now() - 3600000, lastSearchStatus: 'ok', lastSearchError: '', lastSearchCount: 3, nextRunAt: Date.now() + 6 * 3600000 },
       batch: { date: '2026-10-31', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), items, counts },
       run: { state: 'idle', total: 0, done: 0, failed: 0, current: '', startedAt: 0, finishedAt: 0, error: '', stopRequested: false },

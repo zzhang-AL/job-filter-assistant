@@ -398,12 +398,17 @@
       const blocked = detectBlockedPage() || (detectLoginPrompt() ? 'login' : '');
       return blocked ? { ok: false, blocked } : { ok: false, error: '搜索页没有加载出岗位', noCards: true };
     }
-    const scrolls = Math.max(0, Math.min(12, Number(task && task.scrolls) || 0));
+    // 一次滑到底：只要还加载得出新岗位就继续滑，连续 3 次没有新卡片 / 新接口才认为到底。
+    // maxScrolls / maxMs 只是安全上限（防止页面卡住时标签页一直开着），不是常规停止条件。
+    const maxScrolls = Math.max(1, Math.min(2000, Number(task && task.maxScrolls) || 200));
+    const budgetMs = Math.max(60000, Number(task && task.maxMs) || 4 * 60 * 1000);
+    const deadline = Date.now() + budgetMs;
     let lastCards = countJobCards();
     let lastCaptured = captured;
     let stalls = 0;
-    for (let i = 0; i < scrolls; i++) {
-      await sleep(1200 + Math.random() * 1800);
+    let steps = 0;
+    while (steps < maxScrolls && Date.now() < deadline) {
+      await sleep(900 + Math.random() * 1400);
       const target = nearestScrollable(findJobListContainer());
       const beforeCards = countJobCards();
       const beforeCaptured = captured;
@@ -425,14 +430,15 @@
       stalls = grew ? 0 : stalls + 1;
       lastCards = n;
       lastCaptured = captured;
-      if (stalls >= 2) break; // 连续两次滚动都没有新数据：到底了
+      steps++;
+      if (stalls >= 3 || listEnded()) break; // 连续三次没有新数据 / 页面提示没有更多：到底了
     }
     await sleep(2500); // 等最后一个 joblist 响应落地（sniffer 解析 + postMessage 有延迟）
     if (captured === 0 && countJobCards() > 0) {
       // 页面有岗位卡片却完全没嗅探到列表接口：多半是注入/结构变化，报失败让后台当天重试
       return { ok: false, error: '未捕获岗位列表接口（页面结构可能变化）' };
     }
-    return { ok: true, count: lastCards };
+    return { ok: true, count: lastCards, steps };
   }
 
   // 后台任务页读完数据后，像人一样在页面上停留一会儿再关；详情页按 JD 长度多看几秒，并分几次慢慢往下滚
@@ -902,6 +908,14 @@
 
   function countJobCards() {
     return document.querySelectorAll('.job-card-wrap, li.job-card-box, .job-card-wrapper').length;
+  }
+
+  // 列表底部提示（「没有更多了」「已经到底」）：比等三次空滚动更早结束下滑
+  function listEnded() {
+    const box = findJobListContainer();
+    const scope = (box && (box.closest('.job-list-container, .search-job-result, .job-list-box') || box.parentElement)) || null;
+    if (!scope) return false;
+    return /没有更多|到底了|已加载全部|加载完毕/.test(scope.textContent || '');
   }
 
   // 列表容器里，每个「岗位行」= 容器的直接子元素

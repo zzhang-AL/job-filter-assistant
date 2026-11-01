@@ -6,6 +6,7 @@ node_modules/
 .vscode/
 .idea/
 .mcp.json
+WATCHDOG.yml
 *.log
 
 # 系统文件

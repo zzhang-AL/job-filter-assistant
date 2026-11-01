@@ -70,6 +70,8 @@ export async function loadAutoApplyState() {
     lastSearchStatus: '',
     lastSearchError: '',
     lastSearchCount: 0,
+    viewDate: '', // 当天刷岗位计数的日期（跨天自动归零）
+    viewed: 0,
     ...(s && typeof s === 'object' ? s : {}),
   };
 }
@@ -79,6 +81,18 @@ export const saveAutoApplyState = locked(async (patch) => {
   const next = { ...cur, ...(patch && typeof patch === 'object' ? patch : {}) };
   await chrome.storage.local.set({ [STATE_KEY]: next });
   return next;
+});
+
+// 累加「今天刷到多少个岗位」。搜索页的多个 joblist 响应会并发上报，
+// 必须和状态写入共用同一把锁，否则两页都基于旧计数，浏览量会被吞掉。
+export const addAutoApplyViews = locked(async (n, day) => {
+  const add = Math.max(0, Math.floor(Number(n) || 0));
+  const cur = await loadAutoApplyState();
+  const base = cur.viewDate === day ? Math.max(0, Number(cur.viewed) || 0) : 0;
+  if (!add) return { date: cur.viewDate || day, viewed: base };
+  const next = { ...cur, viewDate: day, viewed: base + add };
+  await chrome.storage.local.set({ [STATE_KEY]: next });
+  return { date: day, viewed: next.viewed };
 });
 
 // 批量更新清单条目状态（确认 / 忽略 / 投递结果）；items 里不存在的 uid 忽略

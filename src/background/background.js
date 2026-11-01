@@ -13,9 +13,11 @@ import { insertDetailTask, taskTier, randInt } from '../common/pacing.js';
 import { runInBackgroundTab, tabTaskOf, isWorkerTab, reportWorkerResult, getHalt, clearHalt, isLoginHalt, setHalt, setCapBypass } from './tabWorker.js';
 import {
   buildBossSearchUrl, dailyDue, dateKey, nextRunAt, matchSearchFilter, pickApplyCandidates, mergeApplyBatch, countApply, collectQuota,
+  viewQuota, viewedToday,
 } from '../common/autoApply.js';
 import {
   loadApplyBatch, updateApplyBatch, loadApplyHistory, addApplyHistory, loadAutoApplyState, saveAutoApplyState, markApplyItems,
+  addAutoApplyViews,
 } from '../common/applyStore.js';
 import {
   loadSettings, saveSettings, loadProviders, saveProviders, getActiveProvider,
@@ -282,6 +284,9 @@ async function onJobsCaptured(msg, sender) {
   const autoCfg = settings.autoApply;
   if (autoSearch && autoCfg) {
     const rawCount = jobs.length;
+    // 「每天刷岗位数」按列表接口返回的原始条目算：含重复 / 已沟通 / 被本地筛掉的。
+    // 多个 joblist 响应会并发到达，累加走 storage 写锁（见 applyStore.addAutoApplyViews）。
+    if (rawCount) await addAutoApplyViews(rawCount, dateKey()).catch(() => {});
     jobs = jobs.filter((j) => matchSearchFilter(j, autoCfg).keep);
     searchSeen += rawCount; // 用过滤前的数量判断「有没有搜到」，避免条件过严被误报成没搜到
     if (!jobs.length) return { added: 0, updated: 0, filtered: true };
@@ -1003,11 +1008,19 @@ function pushProgress() {
 // 插件仍然不直接请求平台接口；搜索页的列表由页面自己发请求，插件只读结果。
 const AUTO_APPLY_TICK = 'jh-auto-apply-tick';
 const AUTO_APPLY_ALARM = 'jh-auto-apply-daily';
-const SEARCH_TIMEOUT_MS = 150000;
+// 单次搜索页：一路滑到底，滑到底（连续 3 次没有新岗位 / 页面提示没有更多）才回报。
+// maxMs 是安全上限，防止页面卡住时标签页一直开着；标签页总超时要覆盖它。
+// 后台标签页的定时器会被 Chrome 节流（隐藏超过 5 分钟后进一步降频），
+// 所以单页预算压在 4 分钟以内，刷不够就再开一轮，而不是在一个页面里硬耗。
+const SEARCH_PASS_MS = 4 * 60 * 1000;
+const SEARCH_PASS_TIMEOUT_MS = SEARCH_PASS_MS + 45000;
+const MAX_SEARCH_ROUNDS = 120; // 一天最多开多少轮搜索页（安全上限，正常由「每天刷岗位数」截断）
+const SEARCH_ROUND_PAUSE_MS = [3000, 7000]; // 两轮之间的额外停顿
 let searchRunning = false;
 let searchCaptured = 0;
 let searchSeen = 0;
 let searchCapped = false;
+let searchRound = 0; // 当前是今天第几轮搜索页（仅展示用）
 let collectReserveChain = Promise.resolve();
 let captureChain = Promise.resolve();
 let refreshRunning = false;
@@ -1068,6 +1081,11 @@ async function autoApplyStatus() {
       count: state.collectDate === dateKey() ? Math.max(0, Number(state.collected) || 0) : 0,
       cap: cfg.dailyCollectCap,
     },
+    view: {
+      date: state.viewDate || '',
+      count: viewedToday(state),
+      target: cfg.dailyViewTarget,
+    },
     search: {
       running: searchRunning,
       lastSearchDate: state.lastSearchDate || '',
@@ -1075,6 +1093,7 @@ async function autoApplyStatus() {
       lastSearchStatus: state.lastSearchStatus || '',
       lastSearchError: state.lastSearchError || '',
       lastSearchCount: state.lastSearchCount || 0,
+      round: searchRunning ? searchRound : 0,
       nextRunAt: cfg.enabled && cfg.keywords.length ? nextRunAt(cfg.dailyTime) : 0,
     },
     batch: {
@@ -1303,6 +1322,7 @@ async function triggerDailySearch(trigger = 'manual') {
   searchCaptured = 0;
   searchSeen = 0;
   searchCapped = false;
+  searchRound = 0;
   broadcast(MSG.APPLY_UPDATED, { searchStarted: true, trigger });
   updateActionBadge();
   runDailySearchNow(cfg)
@@ -1332,13 +1352,34 @@ async function runDailySearchNow(cfg) {
   try {
     await syncContacts({ force: true, scheduled: true });
   } catch {}
-  for (const keyword of cfg.keywords) {
+  // 持续刷：每次滑到底 → 关掉页面 → 再开一轮，直到当天「刷到的岗位数」达标。
+  // 每轮开始前都从 storage 读一次：SW 可能在两轮之间被回收，浏览量以 storage 为准，
+  // 重启后会从已刷数量接着刷，不会从零开始。
+  let rounds = 0;
+  let zeroRounds = 0;
+  let paused = false;
+  while (!halted) {
+    const before = await loadAutoApplyState();
+    if (viewQuota(cfg, before) <= 0) break;
+    if (rounds >= MAX_SEARCH_ROUNDS) {
+      // 撞到安全上限还没刷够：当作暂停，不把今天记成已跑完，下一次定时 tick 接着刷
+      paused = true;
+      break;
+    }
+    const keyword = cfg.keywords[rounds % cfg.keywords.length];
+    rounds++;
+    searchRound = rounds;
+    broadcast(MSG.APPLY_UPDATED, { searchRound: rounds, viewed: viewedToday(before) });
+    const viewedBefore = viewedToday(before);
     const res = await runInBackgroundTab(buildBossSearchUrl(cfg, keyword), 'search', {
-      timeoutMs: SEARCH_TIMEOUT_MS,
+      timeoutMs: SEARCH_PASS_TIMEOUT_MS,
       scheduled: true,
-      scrolls: cfg.scrolls,
-      ignoreCaps: true, // 一天的几次搜索不应被补详情额度耗尽而跳过
+      maxScrolls: cfg.maxScrolls,
+      maxMs: SEARCH_PASS_MS,
+      ignoreCaps: true, // 搜索本身不应被补详情额度耗尽而跳过
     });
+    // 等这一页最后的 joblist 响应入账，再判断还差多少
+    await captureChain.catch(() => {});
     if (res.skipped || res.haltReason) {
       halted = true;
       errors.push(res.skipped || res.haltReason);
@@ -1346,11 +1387,28 @@ async function runDailySearchNow(cfg) {
     }
     if (!res.ok) {
       errors.push(res.error || (res.timeout ? `搜索「${keyword}」加载超时` : `搜索「${keyword}」读取失败`));
+      break;
+    }
+    const after = await loadAutoApplyState();
+    if (viewedToday(after) <= viewedBefore) {
+      // 页面打开了却一个岗位都没刷到：连着几轮都这样说明没内容可翻，交给定时重试
+      zeroRounds++;
+      if (zeroRounds >= 3) {
+        errors.push('连续 3 轮没有刷到任何岗位');
+        break;
+      }
+    } else {
+      zeroRounds = 0;
+    }
+    if (viewQuota(cfg, after) > 0) {
+      await sleep(SEARCH_ROUND_PAUSE_MS[0] + Math.random() * (SEARCH_ROUND_PAUSE_MS[1] - SEARCH_ROUND_PAUSE_MS[0]));
     }
   }
   // 等收录合并 / 详情入队落盘（sniffer 消息可能比搜索页回报晚一点到）
-  if (!errors.length) await sleep(2000);
-  const empty = !errors.length && searchSeen === 0;
+  if (!errors.length && rounds) await sleep(2000);
+  // 今天已经刷够目标数量：这一轮根本没开页，不能报成「没有搜到新岗位」
+  const didRun = rounds > 0;
+  const empty = didRun && !errors.length && searchSeen === 0;
   const prev = await loadAutoApplyState();
   const failed = !!errors.length && !halted;
   const retryCount = failed ? Math.min(3, Number(prev.searchRetryCount || 0) + 1) : 0;
@@ -1358,7 +1416,7 @@ async function runDailySearchNow(cfg) {
   await saveAutoApplyState({
     // 未登录 / 验证页属于临时熔断：保留当天原状态（可能已经成功跑过），
     // 只在还没跑过时保持空日期，熔断解除后下一轮 tick 自动重试
-    lastSearchDate: halted ? prev.lastSearchDate || '' : runDay,
+    lastSearchDate: halted || paused ? prev.lastSearchDate || '' : runDay,
     lastSearchAt: Date.now(),
     lastSearchStatus: errors.length ? 'error' : empty ? 'empty' : searchCapped ? 'capped' : 'ok',
     lastSearchError: errors.length
@@ -1366,7 +1424,7 @@ async function runDailySearchNow(cfg) {
       : empty
         ? '没有搜到新岗位（可能都已收录 / 已沟通，或筛选条件过严）'
         : searchCapped
-          ? '今日自动收录已达上限，剩余岗位明天再收；可在设置里调高「每日最多收录」'
+          ? '今日自动收录已达上限，后续只刷不新增岗位；可在设置里调高「每日最多收录」'
           : '',
     lastSearchCount: searchCaptured,
     searchRetryAt: retryAt,

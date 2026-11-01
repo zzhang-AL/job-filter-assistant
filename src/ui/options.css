@@ -358,7 +358,7 @@ input.invalid:focus, textarea.invalid:focus { box-shadow: 0 0 0 3px rgba(255, 59
 .chip-toggle:hover { border-color: var(--text-3); }
 .chip-toggle.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .auto-status { display: flex; flex-direction: column; gap: 12px; }
-.auto-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.auto-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
 .auto-stat { background: var(--card-2); border-radius: 10px; padding: 10px 12px; }
 .auto-stat-n { font-size: 20px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; color: var(--text-2); }
 .auto-stat-n.tone-accent { color: var(--accent); }
