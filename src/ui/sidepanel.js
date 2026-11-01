@@ -1507,7 +1507,9 @@ function renderApplyCard(it) {
     it.summary ? h('div', { class: 'jc-summary tone-' + (it.verdict || 'fair'), text: it.summary }) : null,
     h('div', { class: 'jc-tags' }, [
       it.hrActiveText ? activityChip(it) : null,
-      it.companyContacted ? h('span', { class: 'chip chip-orange', text: '同公司其他岗位' }) : null,
+      it.companyContacted
+        ? h('span', { class: 'chip chip-orange', text: '这家公司已联系过', title: '这家公司已经聊过一个岗位，这条是它的另一个岗位' })
+        : null,
       it.hasGreeting ? h('span', { class: 'chip', text: '有招呼语草稿' }) : null,
     ].filter(Boolean)),
     it.note ? h('div', { class: 'apply-note', text: it.note }) : null,

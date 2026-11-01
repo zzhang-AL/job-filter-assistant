@@ -1235,7 +1235,7 @@ function reconcileApplyBatch(batch, jobs, history, cfg, blockedSet) {
     if (history && history[it.uid]) return { ...it, status: 'skipped', note: '历史已投递过' };
     if (j.contacted === 'job') return { ...it, status: 'skipped', note: '已在别处沟通过' };
     if (j.contacted === 'company' && cfg && !cfg.includeCompanyContacted) {
-      return { ...it, status: 'skipped', note: '已关闭「同公司其他岗位」' };
+      return { ...it, status: 'skipped', note: '这家公司已经聊过，按设置跳过' };
     }
     if (j.dismissedAt) return { ...it, status: 'skipped', note: '已标为不感兴趣' };
     return it;
@@ -1691,7 +1691,7 @@ async function applyOne(item, cfg) {
   if (!job.url) return { ok: false, skipped: true, reason: '岗位缺少链接' };
   if (stored && stored.contacted === 'job') return { ok: true, skipped: true, reason: '已沟通' };
   if (stored && stored.contacted === 'company' && !cfg.includeCompanyContacted) {
-    return { ok: true, skipped: true, reason: '已关闭同公司其他岗位' };
+    return { ok: true, skipped: true, reason: '这家公司已经聊过，按设置跳过' };
   }
   if (stored && stored.dismissedAt) return { ok: true, skipped: true, reason: '已标为不感兴趣' };
   if (item.companyContacted && !cfg.includeCompanyContacted) {

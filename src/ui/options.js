@@ -1359,7 +1359,7 @@ function renderAutoApply() {
         field('每页最多滑动', numInput({ value: cfg.maxScrolls, min: 10, max: 2000, unit: '次', onCommit: async (v) => { cfg.maxScrolls = v ?? 200; const s = await saveSettings({ autoApply: cfg }); return s.autoApply.maxScrolls; } }), { hint: '正常滑到底会自动结束；这里是防止页面卡住的安全上限' }),
         field('失败自动重试', numInput({ value: cfg.searchRetryLimit, min: 0, max: 10, unit: '次', onCommit: async (v) => { cfg.searchRetryLimit = v ?? 5; const s = await saveSettings({ autoApply: cfg }); refresh(); return s.autoApply.searchRetryLimit; } }), { hint: '打开页面失败时按 10 / 20 / 40 分钟退避重试；单页打不开还会当场再试 2 次；0 = 不自动重试' }),
       ]),
-      setRow('保留已沟通公司的其他岗位', '已沟通过的公司，其「未沟通」的岗位仍然纳入清单；已沟通过的岗位本身永远跳过', cfg.includeCompanyContacted, (v) => { cfg.includeCompanyContacted = v; saveNow(); refresh(); }),
+      setRow('已联系过的公司，其他岗位也进清单', '和这家公司聊过之后，它的其他岗位还要不要进投递清单；已经聊过的那个岗位本身永远跳过', cfg.includeCompanyContacted, (v) => { cfg.includeCompanyContacted = v; saveNow(); refresh(); }),
     ]),
   );
 
@@ -1477,7 +1477,7 @@ function renderLists() {
   mainEl.appendChild(
     panel('已沟通', '来源：BOSS 沟通页（后台打开读取会话列表后自动关闭，每 9–15 小时自动同步；你自己打开沟通页时也会顺带同步）、插件里打过招呼的岗位、手动标记。', [
       setRow('跳过已沟通的岗位', '不再收录，批量 / 自动匹配也跳过', settings.skipContacted, (v) => save({ skipContacted: v })),
-      setRow('跳过已沟通公司的其他岗位', '沟通过的公司，它的其他岗位也不再收录', settings.skipContactedCompanies, (v) => save({ skipContactedCompanies: v })),
+      setRow('已联系过的公司，其他岗位不再收录', '和这家公司聊过之后，它的其他岗位也不再收录到岗位库', settings.skipContactedCompanies, (v) => save({ skipContactedCompanies: v })),
       h('div', { class: 'list-toolbar' }, [cInfo, h('div', { class: 'spacer' }), syncBtn]),
       contacts.search,
       contacts.box,
